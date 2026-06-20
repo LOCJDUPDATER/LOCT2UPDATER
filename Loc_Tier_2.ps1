@@ -194,8 +194,6 @@ function Get-ActivityModeratorEntries {
 }
 
 function Get-CheatFolderHits {
-    param([string[]]$Keywords)
-
     $hits = New-Object 'System.Collections.Generic.HashSet[string]'
     $scanPaths = @(
         (Join-Path $env:USERPROFILE "Downloads"),
@@ -215,12 +213,8 @@ function Get-CheatFolderHits {
 
         Get-ChildItem -Path $scanPath -Directory -Recurse -Depth $maxDepth -ErrorAction SilentlyContinue | ForEach-Object {
             $nameLower = $_.Name.ToLower()
-            foreach ($kw in $Keywords) {
-                if ($nameLower -like "*$kw*") {
-                    [void]$hits.Add($_.FullName)
-                    break
-                }
-            }
+            $matched = Get-MatchedCheatKeyword -Text $nameLower -FolderName
+            if ($matched) { [void]$hits.Add($_.FullName) }
         }
     }
 
@@ -477,8 +471,38 @@ function Get-MainCplProcessHits {
 $script:CheatKeywords = @(
     'matcha', 'isabelle', 'severe', 'matrix', 'clarity', 'loader', 'photon', 'valex', 'aimmy',
     'keyauth', 'melatonin', 'evolve', 'serotonin', 'dx9ware', 'unicore', 'monolith', 'skript',
-    'ntfsdump', 'atlanta', 'map', 'eulen', 'hammafia', 'redengine', 'susano', 'bypass'
+    'ntfsdump', 'atlanta', 'eulen', 'hammafia', 'redengine', 'susano', 'bypass'
 )
+
+$script:FolderOnlyKeywords = @('map')
+
+function Test-KeywordTokenMatch {
+    param(
+        [string]$Text,
+        [string]$Keyword
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text) -or [string]::IsNullOrWhiteSpace($Keyword)) { return $false }
+    $escaped = [regex]::Escape($Keyword)
+    return [regex]::IsMatch($Text, "(?i)(^|[\\_\s\-\.])(($escaped))($|[\\_\s\-\.])")
+}
+
+function Test-TrustedProcessPath {
+    param([string]$ExecutablePath)
+
+    if ([string]::IsNullOrWhiteSpace($ExecutablePath)) { return $true }
+    $path = $ExecutablePath.ToLower().Replace('/', '\')
+    $prefixes = @(
+        "$($env:SystemRoot.ToLower())\",
+        "$($env:ProgramFiles.ToLower())\"
+    )
+    $pf86 = ${env:ProgramFiles(x86)}
+    if ($pf86) { $prefixes += "$($pf86.ToLower())\" }
+    foreach ($prefix in $prefixes) {
+        if ($path.StartsWith($prefix)) { return $true }
+    }
+    return $false
+}
 
 $script:MasqueradeProcessPaths = @{
     'svchost.exe'       = @('\windows\system32\svchost.exe', '\windows\syswow64\svchost.exe')
@@ -500,12 +524,27 @@ $script:MasqueradeProcessPaths = @{
 }
 
 function Get-MatchedCheatKeyword {
-    param([string]$Text)
+    param(
+        [string]$Text,
+        [switch]$FolderName
+    )
 
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
     $lower = $Text.ToLower()
+
+    if ($FolderName) {
+        foreach ($kw in ($script:CheatKeywords + $script:FolderOnlyKeywords)) {
+            if ($lower -like "*$kw*") { return $kw }
+        }
+        return $null
+    }
+
     foreach ($kw in $script:CheatKeywords) {
-        if ($lower -like "*$kw*") { return $kw }
+        if ($kw.Length -le 4) {
+            if (Test-KeywordTokenMatch -Text $lower -Keyword $kw) { return $kw }
+        } elseif ($lower -like "*$kw*") {
+            return $kw
+        }
     }
     return $null
 }
@@ -550,7 +589,7 @@ function Get-SuspiciousProcessHits {
                 if ($hits.Add($key)) { $messages += "FAILURE: $procName (PID $procId) [$nameKw]" }
             }
 
-            if ($procPath) {
+            if ($procPath -and -not (Test-TrustedProcessPath -ExecutablePath $procPath)) {
                 $pathKw = Get-MatchedCheatKeyword -Text $procPath
                 if ($pathKw) {
                     $key = "path|$procPath|$pathKw|$procId"
@@ -1015,7 +1054,7 @@ trap {
 $previousExclusions = @{}
 foreach ($ex in (Get-Exclusions)) { $previousExclusions[$ex] = $true }
 $knownCheatFolders = @{}
-foreach ($folder in (Get-CheatFolderHits -Keywords $script:CheatKeywords)) {
+foreach ($folder in (Get-CheatFolderHits)) {
     $knownCheatFolders[$folder] = $true
 }
 $reportedBamDeletions = @{}
@@ -1026,6 +1065,8 @@ $reportedPrefetchHits = @{}
 $reportedCursorChanges = @{}
 $reportedMainCplHits = @{}
 $baselineCursorScheme = Get-CursorSchemeState
+$baselineProcessHits = @{}
+foreach ($hit in (Get-SuspiciousProcessHits)) { $baselineProcessHits[$hit] = $true }
 $monitoringStart = Get-Date
 $folderScanCounter = 0
 $deletionScanCounter = 0
@@ -1092,7 +1133,7 @@ while ($true) {
     $folderScanCounter++
     if ($folderScanCounter -ge 30) {
         $folderScanCounter = 0
-        foreach ($folder in (Get-CheatFolderHits -Keywords $script:CheatKeywords)) {
+        foreach ($folder in (Get-CheatFolderHits)) {
             if (-not $knownCheatFolders.ContainsKey($folder)) {
                 $knownCheatFolders[$folder] = $true
                 Write-MonitorAlert -Message "Cheat folder: $folder" -LogFile $logFile -Color Red
@@ -1104,6 +1145,7 @@ while ($true) {
     if ($processScanCounter -ge 30) {
         $processScanCounter = 0
         foreach ($hit in (Get-SuspiciousProcessHits)) {
+            if ($baselineProcessHits.ContainsKey($hit)) { continue }
             if (-not $reportedProcessHits.ContainsKey($hit)) {
                 $reportedProcessHits[$hit] = $true
                 Write-MonitorAlert -Message $hit -LogFile $logFile -Color Red
@@ -1151,3 +1193,4 @@ while ($true) {
         }
     }
 }
+
