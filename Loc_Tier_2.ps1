@@ -450,6 +450,89 @@ function Get-CursorSchemeChanges {
     return $changes
 }
 
+$script:NvidiaShadowPlayFtsRegPath = 'SOFTWARE\NVIDIA Corporation\Global\NvApp\ShadowPlay\FTS'
+$script:NvidiaStreamproofGuid = '497B8458-4244-4EE6-BFEA-F3D2BA294F21'
+$script:NvidiaStreamproofValues = @(36, 0x24)
+
+function Test-NvidiaGpuPresent {
+    try {
+        $gpus = Get-CimInstance Win32_VideoController -ErrorAction Stop | Select-Object -ExpandProperty Name
+        foreach ($gpu in $gpus) {
+            if ($gpu -match '(?i)nvidia') { return $true }
+        }
+    } catch {}
+    return $false
+}
+
+function Get-NvidiaShadowPlayFtsState {
+    $state = @{
+        Exists = $false
+        Values = @{}
+    }
+
+    try {
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($script:NvidiaShadowPlayFtsRegPath)
+        if (-not $key) { return $state }
+
+        $state.Exists = $true
+        foreach ($name in $key.GetValueNames()) {
+            $raw = $key.GetValue($name)
+            if ($raw -is [int]) {
+                $state.Values[$name] = [int]$raw
+            } elseif ($raw -is [byte[]] -and $raw.Length -ge 4) {
+                $state.Values[$name] = [BitConverter]::ToInt32($raw, 0)
+            } else {
+                $state.Values[$name] = [string]$raw
+            }
+        }
+        $key.Close()
+    } catch {}
+
+    return $state
+}
+
+function Get-NvidiaShadowPlayFtsFingerprint {
+    $state = Get-NvidiaShadowPlayFtsState
+    if (-not $state.Exists) { return 'MISSING' }
+
+    $parts = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($name in ($state.Values.Keys | Sort-Object)) {
+        $parts.Add("$name=$($state.Values[$name])")
+    }
+    if ($parts.Count -eq 0) { return 'EMPTY' }
+    return ($parts -join '|')
+}
+
+function Get-NvidiaShadowPlayFtsAlerts {
+    $alerts = @()
+    $state = Get-NvidiaShadowPlayFtsState
+    $nvidiaGpu = Test-NvidiaGpuPresent
+
+    if (-not $state.Exists) {
+        if ($nvidiaGpu) {
+            $alerts += 'WARNING: ShadowPlay FTS key missing (NVIDIA GPU detected)'
+        } else {
+            $alerts += 'SUCCESS: NVIDIA ShadowPlay N/A'
+        }
+        return $alerts
+    }
+
+    foreach ($entry in $state.Values.GetEnumerator()) {
+        $nameNorm = $entry.Key.Trim('{}').ToLower()
+        if ($nameNorm -ne $script:NvidiaStreamproofGuid.ToLower()) { continue }
+        if ($entry.Value -isnot [int]) { continue }
+        if ($script:NvidiaStreamproofValues -contains $entry.Value) {
+            $alerts += "FAILURE: NVIDIA streamproof bypass ($($entry.Key)=$($entry.Value))"
+        }
+    }
+
+    if ($alerts.Count -eq 0) {
+        $alerts += 'SUCCESS: ShadowPlay FTS clean'
+    }
+
+    return $alerts
+}
+
 function Get-MainCplProcessHits {
     $seen = New-Object 'System.Collections.Generic.HashSet[int]'
     $messages = @()
@@ -610,6 +693,113 @@ function Get-SuspiciousProcessHits {
     return $messages
 }
 
+function Get-ProcessSuspiciousReasons {
+    param(
+        [string]$ProcessName,
+        [string]$ExecutablePath
+    )
+
+    $reasons = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+
+    if ([string]::IsNullOrWhiteSpace($ExecutablePath)) {
+        if ($ProcessName -notmatch '(?i)^(System|Registry|Secure System|Memory Compression|Idle)$') {
+            [void]$reasons.Add('no image path')
+        }
+    } else {
+        $leaf = Split-Path $ExecutablePath -Leaf
+        if ($ProcessName -and $leaf -and ($ProcessName.ToLower() -ne $leaf.ToLower())) {
+            [void]$reasons.Add('name/path mismatch')
+        }
+    }
+
+    if (Test-MasqueradeProcessPath -ProcessName $ProcessName -ExecutablePath $ExecutablePath) {
+        [void]$reasons.Add('masquerade')
+    }
+
+    $nameKw = Get-MatchedCheatKeyword -Text $ProcessName
+    if ($nameKw) { [void]$reasons.Add($nameKw) }
+
+    if ($ExecutablePath -and -not (Test-TrustedProcessPath -ExecutablePath $ExecutablePath)) {
+        $pathKw = Get-MatchedCheatKeyword -Text $ExecutablePath
+        if ($pathKw) { [void]$reasons.Add($pathKw) }
+    }
+
+    return @($reasons)
+}
+
+function Test-UserLandProcessPath {
+    param([string]$ExecutablePath)
+
+    if ([string]::IsNullOrWhiteSpace($ExecutablePath)) { return $false }
+    $path = $ExecutablePath.ToLower().Replace('/', '\')
+    foreach ($marker in @('\downloads\', '\desktop\', '\appdata\', '\temp\', '\programdata\')) {
+        if ($path -like "*$marker*") { return $true }
+    }
+    return $false
+}
+
+function Get-ProcessSnapshot {
+    $snap = @{}
+    try {
+        Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object {
+            $procId = [int]$_.ProcessId
+            $path = [string]$_.ExecutablePath
+            $name = [string]$_.Name
+            $reasons = @(Get-ProcessSuspiciousReasons -ProcessName $name -ExecutablePath $path)
+            $snap[$procId] = @{
+                Name       = $name
+                Path       = $path
+                Reasons    = $reasons
+                UserLand   = Test-UserLandProcessPath -ExecutablePath $path
+                Suspicious = ($reasons.Count -gt 0)
+            }
+        }
+    } catch {}
+    return $snap
+}
+
+function Update-ProcessChangeMonitor {
+    param(
+        [hashtable]$Previous,
+        [hashtable]$Current,
+        [hashtable]$Watched,
+        [string]$LogFile
+    )
+
+    foreach ($procId in $Current.Keys) {
+        if ($Previous.ContainsKey($procId)) { continue }
+
+        $proc = $Current[$procId]
+        $label = "$($proc.Name) (PID $procId)"
+        if ($proc.Path) { $label += " -> $($proc.Path)" }
+
+        if ($proc.Suspicious) {
+            $tag = $proc.Reasons -join ', '
+            Write-MonitorAlert -Message "Started [$tag]: $label" -LogFile $LogFile -Color Red
+            $Watched[$procId] = $proc
+        } elseif ($proc.UserLand) {
+            Write-MonitorAlert -Message "Started: $label" -LogFile $LogFile -Color Yellow
+            $Watched[$procId] = $proc
+        }
+    }
+
+    foreach ($procId in $Previous.Keys) {
+        if ($Current.ContainsKey($procId)) { continue }
+
+        $proc = $Previous[$procId]
+        if (-not $proc.Suspicious -and -not $proc.UserLand -and -not $Watched.ContainsKey($procId)) { continue }
+
+        $label = "$($proc.Name) (PID $procId)"
+        if ($proc.Path) { $label += " -> $($proc.Path)" }
+        if ($proc.Reasons.Count -gt 0) {
+            Write-MonitorAlert -Message "Exited [$($proc.Reasons -join ', ')]: $label" -LogFile $LogFile -Color $(if ($proc.Suspicious) { 'Red' } else { 'Yellow' })
+        } else {
+            Write-MonitorAlert -Message "Exited: $label" -LogFile $LogFile -Color Yellow
+        }
+        if ($Watched.ContainsKey($procId)) { $Watched.Remove($procId) | Out-Null }
+    }
+}
+
 $script:BaselineBamKeys = @{}
 $script:BaselinePrefetchFiles = @{}
 
@@ -632,6 +822,7 @@ $defenderOutput = @()
 $exclusionsOutput = @()
 $memoryIntegrityOutput = @()
 $registryOutput = @()
+$nvidiaOutput = @()
 
 # ----- Module Check -----
 $modules = @("Microsoft.PowerShell.Operation.Validation","PackageManagement","Pester","PowerShellGet","PSReadline")
@@ -724,6 +915,13 @@ try {
     if ($enabled -eq 1) { $memoryIntegrityOutput += "SUCCESS: Memory Integrity on"; $passedChecks++ }
     else { $memoryIntegrityOutput += "FAILURE: Memory Integrity off" }
 } catch { $memoryIntegrityOutput += "WARNING: Memory Integrity unavailable" }
+
+# ----- NVIDIA ShadowPlay FTS (streamproof bypass) -----
+$totalChecks++
+foreach ($line in (Get-NvidiaShadowPlayFtsAlerts)) {
+    $nvidiaOutput += $line
+    if ($line -like 'SUCCESS*') { $passedChecks++ }
+}
 
 # ----- Process Scan -----
 $totalChecks++
@@ -825,6 +1023,7 @@ if (-not $registryHit -and ($registryOutput -notlike 'WARNING*')) {
 
 Write-Section "System" ($moduleOutput + $cpuGpuOutput + $osOutput + $vmOutput)
 Write-Section "Defender" ($defenderOutput + $exclusionsOutput + $memoryIntegrityOutput)
+Write-Section "NVIDIA ShadowPlay" $nvidiaOutput
 Write-Section "Processes" $processOutput
 Write-Section "KeyAuth" $keyAuthOutput
 Write-Section "PowerShell" $powershellSigOutput
@@ -1032,7 +1231,7 @@ if (Test-Path $lastActivityExe) {
 
 Wait-NextStep "[6/6] Press Enter" "[6/6] Live Monitor"
 Show-LoadingBar
-Write-Host "Keep this window open during the match." -ForegroundColor Yellow
+Write-Host "Keep this window open during the match. Must show again after match." -ForegroundColor Yellow
 Write-Host ""
 
 $logFile = "$env:ProgramData\security_events.log"
@@ -1060,17 +1259,18 @@ foreach ($folder in (Get-CheatFolderHits)) {
 $reportedBamDeletions = @{}
 $reportedPrefetchDeletions = @{}
 $reportedTamperEvents = @{}
-$reportedProcessHits = @{}
 $reportedPrefetchHits = @{}
 $reportedCursorChanges = @{}
 $reportedMainCplHits = @{}
 $baselineCursorScheme = Get-CursorSchemeState
-$baselineProcessHits = @{}
-foreach ($hit in (Get-SuspiciousProcessHits)) { $baselineProcessHits[$hit] = $true }
+$baselineNvidiaFts = Get-NvidiaShadowPlayFtsFingerprint
+$reportedNvidiaFtsChanges = @{}
+$lastProcessSnapshot = Get-ProcessSnapshot
+$watchedProcesses = @{}
 $monitoringStart = Get-Date
 $folderScanCounter = 0
 $deletionScanCounter = 0
-$processScanCounter = 0
+$processChangeCounter = 0
 $mainCplScanCounter = 0
 
 while ($true) {
@@ -1141,16 +1341,12 @@ while ($true) {
         }
     }
 
-    $processScanCounter++
-    if ($processScanCounter -ge 30) {
-        $processScanCounter = 0
-        foreach ($hit in (Get-SuspiciousProcessHits)) {
-            if ($baselineProcessHits.ContainsKey($hit)) { continue }
-            if (-not $reportedProcessHits.ContainsKey($hit)) {
-                $reportedProcessHits[$hit] = $true
-                Write-MonitorAlert -Message $hit -LogFile $logFile -Color Red
-            }
-        }
+    $processChangeCounter++
+    if ($processChangeCounter -ge 3) {
+        $processChangeCounter = 0
+        $currentProcessSnapshot = Get-ProcessSnapshot
+        Update-ProcessChangeMonitor -Previous $lastProcessSnapshot -Current $currentProcessSnapshot -Watched $watchedProcesses -LogFile $logFile
+        $lastProcessSnapshot = $currentProcessSnapshot
     }
 
     $deletionScanCounter++
@@ -1191,6 +1387,16 @@ while ($true) {
             $reportedTamperEvents[$eventKey] = $true
             Write-MonitorAlert -Message "Log cleared ($($ev.Id))" -LogFile $logFile -Color Red
         }
+
+        $currentNvidiaFts = Get-NvidiaShadowPlayFtsFingerprint
+        if ($currentNvidiaFts -ne $baselineNvidiaFts -and -not $reportedNvidiaFtsChanges.ContainsKey($currentNvidiaFts)) {
+            $reportedNvidiaFtsChanges[$currentNvidiaFts] = $true
+            Write-MonitorAlert -Message "NVIDIA ShadowPlay FTS changed: $currentNvidiaFts" -LogFile $logFile -Color Red
+            foreach ($line in (Get-NvidiaShadowPlayFtsAlerts)) {
+                if ($line -like 'FAILURE*') {
+                    Write-MonitorAlert -Message $line -LogFile $logFile -Color Red
+                }
+            }
+        }
     }
 }
-
