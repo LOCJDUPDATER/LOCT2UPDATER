@@ -33,7 +33,7 @@ function Test-Admin {
     return $p.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 }
 
-$script:LocTier2Version = '2.5.2'
+$script:LocTier2Version = '2.5.3'
 
 function Open-LocalMachineRegistryKey {
     param([string]$SubKeyPath)
@@ -143,14 +143,112 @@ function Invoke-ToolDownload {
         [string]$DestDir
     )
 
+    if (-not $Url -or -not $ZipPath -or -not $DestDir) { return $false }
+
     try {
-        Invoke-WebRequest -Uri $Url -OutFile $ZipPath -UseBasicParsing -TimeoutSec 120
-        if (-not (Test-Path $ZipPath)) { return $false }
-        if (-not (Test-Path $DestDir)) { New-Item -ItemType Directory -Path $DestDir -Force | Out-Null }
+        $zipParent = Split-Path $ZipPath -Parent
+        if ($zipParent -and -not (Test-Path $zipParent)) {
+            New-Item -ItemType Directory -Path $zipParent -Force | Out-Null
+        }
+        if (-not (Test-Path $DestDir)) {
+            New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
+        }
+
+        if (Test-Path -LiteralPath $ZipPath) {
+            Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue
+        }
+
+        $previousProtocol = [Net.ServicePointManager]::SecurityProtocol
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+        $downloaded = $false
+        foreach ($attempt in 1..2) {
+            try {
+                Invoke-WebRequest -Uri $Url -OutFile $ZipPath -UseBasicParsing -TimeoutSec 120 `
+                    -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' | Out-Null
+                if ((Test-Path -LiteralPath $ZipPath) -and ((Get-Item -LiteralPath $ZipPath).Length -gt 1024)) {
+                    $downloaded = $true
+                    break
+                }
+            } catch {
+                if ($attempt -eq 2) { throw }
+                Start-Sleep -Seconds 2
+            }
+        }
+
+        [Net.ServicePointManager]::SecurityProtocol = $previousProtocol
+        if (-not $downloaded) { return $false }
+
         Expand-Archive -Path $ZipPath -DestinationPath $DestDir -Force
         return $true
     } catch {
         Write-Warning "Download failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Resolve-ToolExecutable {
+    param(
+        [string]$DestDir,
+        [string]$ExeName,
+        [string[]]$FallbackNames = @()
+    )
+
+    foreach ($name in @($ExeName) + @($FallbackNames)) {
+        $direct = Join-Path $DestDir $name
+        if (Test-Path -LiteralPath $direct) { return $direct }
+    }
+
+    foreach ($name in @($ExeName) + @($FallbackNames)) {
+        $found = Get-ChildItem -Path $DestDir -Filter $name -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($found) { return $found.FullName }
+    }
+
+    return $null
+}
+
+function Start-LocExternalTool {
+    param(
+        [string]$Name,
+        [string]$Url,
+        [string]$ZipPath,
+        [string]$DestDir,
+        [string]$ExeName,
+        [string[]]$FallbackExeNames = @(),
+        [string[]]$StartArguments = @(),
+        [switch]$Wait,
+        [ValidateSet('Normal', 'Maximized')]
+        [string]$WindowStyle = 'Normal'
+    )
+
+    $exe = Resolve-ToolExecutable -DestDir $DestDir -ExeName $ExeName -FallbackNames $FallbackExeNames
+    if (-not $exe) {
+        if (Invoke-ToolDownload -Url $Url -ZipPath $ZipPath -DestDir $DestDir) {
+            $exe = Resolve-ToolExecutable -DestDir $DestDir -ExeName $ExeName -FallbackNames $FallbackExeNames
+        }
+    }
+
+    if (-not $exe) {
+        Write-Host "WARNING: $Name unavailable (download or extract failed)." -ForegroundColor Yellow
+        return $false
+    }
+
+    try { Unblock-File -LiteralPath $exe -ErrorAction SilentlyContinue } catch {}
+
+    try {
+        $startParams = @{
+            FilePath    = $exe
+            WindowStyle = $WindowStyle
+            PassThru    = $true
+            ErrorAction = 'Stop'
+        }
+        if ($StartArguments.Count -gt 0) { $startParams['ArgumentList'] = $StartArguments }
+
+        $proc = Start-Process @startParams
+        if ($Wait) { $proc.WaitForExit() }
+        return $true
+    } catch {
+        Write-Host "WARNING: $Name failed to start: $($_.Exception.Message)" -ForegroundColor Yellow
         return $false
     }
 }
@@ -1466,39 +1564,24 @@ try {
 Wait-NextStep "[4/6] Press Enter" "[4/6] Process Explorer"
 Show-LoadingBar
 
-$procDir = "$env:TEMP\ProcessExplorer"
-$procExe = "$procDir\procexp64.exe"
-$procZip = "$env:TEMP\procexp.zip"
-$procURL = "https://download.sysinternals.com/files/ProcessExplorer.zip"
-
-if (-not (Test-Path $procExe)) {
-    if (-not (Invoke-ToolDownload -Url $procURL -ZipPath $procZip -DestDir $procDir)) {
-        Write-Host "WARNING: Process Explorer unavailable" -ForegroundColor Yellow
-    }
-}
-
-if (Test-Path $procExe) {
-    $proc = Start-Process -FilePath $procExe -PassThru
-    $proc.WaitForExit()
-}
+Start-LocExternalTool -Name 'Process Explorer' `
+    -Url 'https://download.sysinternals.com/files/ProcessExplorer.zip' `
+    -ZipPath "$env:TEMP\procexp.zip" `
+    -DestDir "$env:TEMP\ProcessExplorer" `
+    -ExeName 'procexp64.exe' `
+    -FallbackExeNames @('procexp.exe') `
+    -StartArguments @('/accepteula') `
+    -Wait | Out-Null
 
 Wait-NextStep "[5/6] Press Enter" "[5/6] Last Activity Viewer"
 Show-LoadingBar
 
-$lastActivityDir = "$env:TEMP\LastActivity"
-$lastActivityExe = "$lastActivityDir\LastActivityView.exe"
-
-if (-not (Test-Path $lastActivityExe)) {
-    $lastActivityURL = "https://www.nirsoft.net/utils/lastactivityview.zip"
-    $lastActivityZip = "$env:TEMP\LastActivityView.zip"
-    if (-not (Invoke-ToolDownload -Url $lastActivityURL -ZipPath $lastActivityZip -DestDir $lastActivityDir)) {
-        Write-Host "WARNING: Last Activity Viewer unavailable" -ForegroundColor Yellow
-    }
-}
-
-if (Test-Path $lastActivityExe) {
-    Start-Process -FilePath $lastActivityExe -WindowStyle Maximized
-}
+Start-LocExternalTool -Name 'Last Activity Viewer' `
+    -Url 'https://www.nirsoft.net/utils/lastactivityview.zip' `
+    -ZipPath "$env:TEMP\LastActivityView.zip" `
+    -DestDir "$env:TEMP\LastActivity" `
+    -ExeName 'LastActivityView.exe' `
+    -WindowStyle Maximized | Out-Null
 
 Wait-NextStep "[6/6] Press Enter" "[6/6] Live Monitor"
 Show-LoadingBar
