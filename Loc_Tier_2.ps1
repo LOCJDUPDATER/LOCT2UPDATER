@@ -1,12 +1,33 @@
 Clear-Host
 
-$script:LocTier1Version = '1.5.0'
+if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+    if ($PSCommandPath) {
+        $hostExe = (Get-Process -Id $PID).Path
+        $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', "`"$PSCommandPath`"")
+        Start-Process -FilePath $hostExe -ArgumentList $argList -Wait | Out-Null
+        exit
+    } else {
+        Write-Warning "WinForms steps need STA mode. Use: powershell -STA -File `"<script.ps1>`""
+    }
+}
+
+$script:WinFormsLoaded = $false
+function Initialize-WinForms {
+    if (-not $script:WinFormsLoaded) {
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
+        [System.Windows.Forms.Application]::EnableVisualStyles()
+        $script:WinFormsLoaded = $true
+    }
+}
 
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $p = New-Object Security.Principal.WindowsPrincipal($id)
     return $p.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 }
+
+$script:LocTier2Version = '2.5.0'
 
 function Open-LocalMachineRegistryKey {
     param([string]$SubKeyPath)
@@ -53,29 +74,60 @@ function Add-RegistryKeyFingerprint {
 }
 
 # ===============================
-# ASCII Banner (LOC RECORDING POLICY T1)
+# ASCII Banner (LOC RECORDING POLICY T2)
 # ===============================
-Write-Host "   __   ____  _____  ___  _____________  ___  ___  _____  _______  ___  ____  __   ___________  __  _________" -ForegroundColor Cyan
-Write-Host "  / /  / __ \/ ___/ / _ \/ __/ ___/ __ \/ _ \/ _ \/  _/ |/ / ___/ / _ \/ __ \/ /  /  _/ ___/\ \/ / /_  __<  /" -ForegroundColor Cyan
-Write-Host " / /__/ /_/ / /__  / , _/ _// /__/ /_/ / , _/ // // //    / (_ / / ___/ /_/ / /___/ // /__   \  /   / /  / / " -ForegroundColor Cyan
-Write-Host "/____/\____/\___/ /_/|_/___/\___/\____/_/|_/____/___/_/|_/\___/ /_/   \____/____/___/\___/   /_/   /_/  /_/  " -ForegroundColor Cyan
+Write-Host ' _     ___   ____   ____  _____ ____ ___  ____  ____ ___ _   _  ____ ' -ForegroundColor Cyan
+Write-Host '| |   / _ \ / ___| |  _ \| ____/ ___/ _ \|  _ \|  _ \_ _| \ | |/ ___|' -ForegroundColor Cyan
+Write-Host '| |  | | | | |     | |_) |  _|| |  | | | | |_) | | | | ||  \| | |  _ ' -ForegroundColor Cyan
+Write-Host '| |__| |_| | |___  |  _ <| |__| |__| |_| |  _ <| |_| | || |\| | |_| |' -ForegroundColor Cyan
+Write-Host '|_____\___/ \____| |_| \_\_____\____\___/|_| \_\____/___|_| \_|\____|' -ForegroundColor Cyan
+Write-Host ' ____   ___  _     ___ ______   __  _____ ____  ' -ForegroundColor Cyan
+Write-Host '|  _ \ / _ \| |   |_ _/ ___\ \ / / |_   _|___ \ ' -ForegroundColor Cyan
+Write-Host '| |_) | | | | |    | | |    \ V /    | |   __) |' -ForegroundColor Cyan
+Write-Host '|  __/| |_| | |___ | | |___  | |     | |  / __/ ' -ForegroundColor Cyan
+Write-Host '|_|    \___/|_____|___\____| |_|     |_| |_____|' -ForegroundColor Cyan
 Write-Host ""
-Write-Host "LOC Tier 1 v$($script:LocTier1Version)" -ForegroundColor White
-Write-Host "Discord.gg/locx | Complete with 100% success rate" -ForegroundColor White
+Write-Host "LOC Tier 2 v$($script:LocTier2Version)" -ForegroundColor White
 Write-Host ""
 if (-not (Test-Admin)) {
     Write-Host "WARNING: Run as Administrator for full results." -ForegroundColor Yellow
 }
 
-function Write-Section {
-    param($Title, $Lines)
-    Write-Host "--- $Title ---" -ForegroundColor Cyan
-    foreach ($line in $Lines) {
-        if ($line -like "SUCCESS*") { Write-Host $line -ForegroundColor Green }
-        elseif ($line -like "FAILURE*") { Write-Host $line -ForegroundColor Red }
-        elseif ($line -like "WARNING*") { Write-Host $line -ForegroundColor Yellow }
+# ===============================
+# Loading Bar Function
+# ===============================
+function Show-LoadingBar {
+    for ($i = 0; $i -le 20; $i++) {
+        $percent = $i * 5
+        $bar = ("#" * $i) + ("-" * (20 - $i))
+        Write-Host "`r[ $bar ] $percent%" -NoNewline
+        Start-Sleep -Milliseconds 60
     }
     Write-Host ""
+}
+
+function Write-Section {
+    param($Title, $Lines)
+
+    if (-not $Lines -or $Lines.Count -eq 0) { return }
+    Write-Host $Title -ForegroundColor Cyan
+    foreach ($line in $Lines) {
+        if ($line -like "SUCCESS*") { Write-Host "  $line" -ForegroundColor Green }
+        elseif ($line -like "FAILURE*") { Write-Host "  $line" -ForegroundColor Red }
+        elseif ($line -like "WARNING*") { Write-Host "  $line" -ForegroundColor Yellow }
+        else { Write-Host "  $line" -ForegroundColor Gray }
+    }
+    Write-Host ""
+}
+
+function Wait-NextStep {
+    param(
+        [string]$Prompt,
+        [string]$Label
+    )
+    Read-Host $Prompt | Out-Null
+    Clear-Host
+    Write-Host $Label -ForegroundColor Cyan
 }
 
 function Invoke-ToolDownload {
@@ -95,6 +147,126 @@ function Invoke-ToolDownload {
         Write-Warning "Download failed: $($_.Exception.Message)"
         return $false
     }
+}
+
+function Get-BamDevicePath {
+    param([string]$Remainder)
+
+    foreach ($drive in Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue) {
+        if ($drive.Name -notmatch '^[A-Z]$') { continue }
+        $candidate = "$($drive.Name):\$Remainder"
+        if (Test-Path -LiteralPath $candidate -ErrorAction SilentlyContinue) {
+            return $candidate
+        }
+    }
+
+    return "$env:SystemDrive\$Remainder"
+}
+
+function Get-ActivityModeratorEntries {
+    param([int]$SignatureBudget = 100)
+
+    $entries = @()
+    $seen = @{}
+    $signaturesChecked = 0
+    $roots = @(
+        'SYSTEM\CurrentControlSet\Services\bam\State\UserSettings',
+        'SYSTEM\CurrentControlSet\Services\dam\State\UserSettings'
+    )
+
+    foreach ($root in $roots) {
+        $rootKey = Open-LocalMachineRegistryKey -SubKeyPath $root
+        if (-not $rootKey) { continue }
+
+        foreach ($sidName in $rootKey.GetSubKeyNames()) {
+            if ($sidName -eq 'S-1-5-18') { continue }
+
+            $sidKey = $rootKey.OpenSubKey($sidName)
+            if (-not $sidKey) { continue }
+
+            foreach ($valueName in $sidKey.GetValueNames()) {
+                try {
+                    $raw = $sidKey.GetValue($valueName)
+                    if ($raw -isnot [byte[]] -or $raw.Length -lt 8) { continue }
+
+                    $fileTime = [BitConverter]::ToInt64($raw, 0)
+                    if ($fileTime -le 0) { continue }
+
+                    $execTime = [DateTime]::FromFileTimeUtc($fileTime).ToLocalTime()
+                    $exe = Split-Path $valueName -Leaf
+                    $path = ""
+
+                    if ($valueName -match '^\\Device\\HarddiskVolume\d+\\(.+)$') {
+                        $path = Get-BamDevicePath -Remainder $matches[1]
+                    } elseif ($valueName -match '^\\??\\(.+)$') {
+                        $path = Get-BamDevicePath -Remainder $matches[1]
+                    }
+
+                    $dedupeKey = "$exe|$path|$($execTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+                    if ($seen.ContainsKey($dedupeKey)) { continue }
+                    $seen[$dedupeKey] = $true
+
+                    $sigStatus = "N/A"
+                    if ($path -and (Test-Path -LiteralPath $path -ErrorAction SilentlyContinue)) {
+                        if ($signaturesChecked -lt $SignatureBudget) {
+                            try {
+                                $sig = Get-AuthenticodeSignature -LiteralPath $path
+                                $sigStatus = if ($sig.Status -eq "Valid") { "Valid" } else { "Invalid" }
+                            } catch {
+                                $sigStatus = "Invalid"
+                            }
+                            $signaturesChecked++
+                        } else {
+                            $sigStatus = "N/A"
+                        }
+                    }
+
+                    $timeText = $execTime.ToString("yyyy-MM-dd HH:mm:ss")
+                    $entries += [PSCustomObject]@{
+                        'Examiner Time'       = $timeText
+                        'Last Execution Time' = $timeText
+                        'Application'         = $exe
+                        'Path'                = $path
+                        'Signature'           = $sigStatus
+                    }
+                } catch { continue }
+            }
+
+            $sidKey.Close()
+        }
+
+        $rootKey.Close()
+    }
+
+    return $entries
+}
+
+function Get-CheatFolderHits {
+    $hits = New-Object 'System.Collections.Generic.HashSet[string]'
+    $scanPaths = @(
+        (Join-Path $env:USERPROFILE "Downloads"),
+        (Join-Path $env:USERPROFILE "Desktop"),
+        $env:LOCALAPPDATA,
+        $env:APPDATA,
+        $env:ProgramData,
+        $env:TEMP,
+        "$env:SystemDrive\"
+    )
+
+    foreach ($scanPath in $scanPaths) {
+        if (-not (Test-Path $scanPath)) { continue }
+
+        $maxDepth = 2
+        if ($scanPath -eq "$env:SystemDrive\") { $maxDepth = 1 }
+
+        Get-ChildItem -Path $scanPath -Directory -Recurse -Depth $maxDepth -ErrorAction SilentlyContinue | ForEach-Object {
+            $nameLower = $_.Name.ToLower()
+            $matched = Get-MatchedCheatKeyword -Text $nameLower -FolderName
+            if ($matched) { [void]$hits.Add($_.FullName) }
+        }
+    }
+
+    return @($hits)
 }
 
 function Get-Exclusions {
@@ -267,32 +439,42 @@ function Get-RegistryToolProcessHits {
     return $messages
 }
 
-function Get-CheatFolderHits {
-    $hits = New-Object 'System.Collections.Generic.HashSet[string]'
-    $scanPaths = @(
-        (Join-Path $env:USERPROFILE "Downloads"),
-        (Join-Path $env:USERPROFILE "Desktop"),
-        $env:LOCALAPPDATA,
-        $env:APPDATA,
-        $env:ProgramData,
-        $env:TEMP,
-        "$env:SystemDrive\"
-    )
+function Get-PrefetchLastRunTime {
+    param([string]$FilePath)
 
-    foreach ($scanPath in $scanPaths) {
-        if (-not (Test-Path $scanPath)) { continue }
+    try {
+        $fs = [System.IO.File]::OpenRead($FilePath)
+        try {
+            $buffer = New-Object byte[] 144
+            $read = $fs.Read($buffer, 0, $buffer.Length)
+            if ($read -lt 24) { return "Unknown" }
 
-        $maxDepth = 2
-        if ($scanPath -eq "$env:SystemDrive\") { $maxDepth = 1 }
+            $version = [BitConverter]::ToInt32($buffer, 0)
+            $candidates = @()
 
-        Get-ChildItem -Path $scanPath -Directory -Recurse -Depth $maxDepth -ErrorAction SilentlyContinue | ForEach-Object {
-            $nameLower = $_.Name.ToLower()
-            $matched = Get-MatchedCheatKeyword -Text $nameLower -FolderName
-            if ($matched) { [void]$hits.Add($_.FullName) }
+            if ($read -ge 24) {
+                $candidates += [BitConverter]::ToInt64($buffer, 16)
+            }
+            if ($read -ge 136 -and $version -ge 26) {
+                $candidates += [BitConverter]::ToInt64($buffer, 128)
+            }
+
+            foreach ($fileTime in $candidates) {
+                if ($fileTime -le 0) { continue }
+                try {
+                    $dt = [DateTime]::FromFileTimeUtc($fileTime).ToLocalTime()
+                    if ($dt.Year -ge 2000 -and $dt.Year -le 2100) {
+                        return $dt.ToString("yyyy-MM-dd HH:mm:ss")
+                    }
+                } catch {}
+            }
+            return "Unknown"
+        } finally {
+            $fs.Close()
         }
+    } catch {
+        return "Unknown"
     }
-
-    return @($hits)
 }
 
 function Get-BamRegistryFingerprints {
@@ -380,9 +562,22 @@ function Write-MonitorAlert {
     try {
         Add-Content -LiteralPath $LogFile -Value "[$timestamp] $Message" -ErrorAction Stop
     } catch {
-        $fallback = Join-Path $env:TEMP 'loc_tier1_security_events.log'
+        $fallback = Join-Path $env:TEMP 'loc_tier2_security_events.log'
         try { Add-Content -LiteralPath $fallback -Value "[$timestamp] $Message" -ErrorAction SilentlyContinue } catch {}
     }
+}
+
+function Convert-UserAssistName {
+    param([string]$Name)
+
+    if ([string]::IsNullOrEmpty($Name)) { return $Name }
+    $chars = $Name.ToCharArray()
+    for ($i = 0; $i -lt $chars.Length; $i++) {
+        $c = [int][char]$chars[$i]
+        if ($c -ge 65 -and $c -le 90) { $chars[$i] = [char](((($c - 65 + 13) % 26) + 65)) }
+        elseif ($c -ge 97 -and $c -le 122) { $chars[$i] = [char](((($c - 97 + 13) % 26) + 97)) }
+    }
+    return -join $chars
 }
 
 $script:CursorSchemeValueNames = @(
@@ -795,53 +990,30 @@ $script:BaselineBamKeys = @{}
 $script:BaselinePrefetchFiles = @{}
 
 # ===============================
-# Step 1 Indicator
+# STEP 1: System Check
 # ===============================
-Write-Host "[ Step 1 of 3 - System Check ]" -ForegroundColor Cyan
-Write-Host ""
+Write-Host "[1/6] System Check" -ForegroundColor Cyan
+Show-LoadingBar
 
-# ===============================
-# Loading Bar
-# ===============================
-for ($i = 0; $i -le 20; $i++) {
-    $percent = $i * 5
-    $bar = ("#" * $i) + ("-" * (20 - $i))
-    Write-Host "`r[ $bar ] $percent%" -NoNewline
-    Start-Sleep -Milliseconds 120
-}
-Write-Host "`n"
-
-# ===============================
-# Initialize
-# ===============================
 $passedChecks = 0
-$totalChecks  = 0
-
-$moduleOutput          = @()
-$cpuGpuOutput          = @()
-$processOutput         = @()
-$keyAuthOutput         = @()
-$powershellSigOutput   = @()
-$osOutput              = @()
-$vmOutput              = @()
-$defenderOutput        = @()
-$exclusionsOutput      = @()
-$allowedThreatsOutput  = @()
+$totalChecks = 0
+$moduleOutput = @()
+$cpuGpuOutput = @()
+$processOutput = @()
+$keyAuthOutput = @()
+$powershellSigOutput = @()
+$osOutput = @()
+$vmOutput = @()
+$defenderOutput = @()
+$exclusionsOutput = @()
+$allowedThreatsOutput = @()
 $memoryIntegrityOutput = @()
-$nvidiaOutput          = @()
-$registryOutput        = @()
+$registryOutput = @()
+$nvidiaOutput = @()
 
-# ===============================
-# Module Check
-# ===============================
+# ----- Module Check -----
+$modules = @("Microsoft.PowerShell.Operation.Validation","PackageManagement","Pester","PowerShellGet","PSReadline")
 $totalChecks++
-$modules = @(
-    "Microsoft.PowerShell.Operation.Validation",
-    "PackageManagement",
-    "Pester",
-    "PowerShellGet",
-    "PSReadline"
-)
 $moduleFails = @()
 foreach ($mod in $modules) {
     if (-not (Get-Module -ListAvailable -Name $mod -ErrorAction SilentlyContinue)) {
@@ -855,40 +1027,45 @@ if ($moduleFails.Count -eq 0) {
     foreach ($fail in $moduleFails) { $moduleOutput += "FAILURE: Missing module $fail" }
 }
 
-# ===============================
-# CPU & GPU Detections
-# ===============================
+# ----- CPU & GPU Detections -----
 try {
     $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name
-    if ($cpu) { $cpuGpuOutput += "SUCCESS: CPU detected -> $cpu" }
-
-    $gpus = Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name
-    foreach ($gpu in $gpus) {
-        $cpuGpuOutput += "SUCCESS: GPU detected -> $gpu"
-    }
+    $gpu = (Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) -join ', '
+    if ($cpu -and $gpu) { $cpuGpuOutput += "SUCCESS: $cpu | $gpu" }
+    elseif ($cpu) { $cpuGpuOutput += "SUCCESS: $cpu" }
 } catch {
-    $cpuGpuOutput += "WARNING: Unable to query CPU/GPU information."
+    $cpuGpuOutput += "WARNING: Hardware query failed"
 }
 
-# ===============================
-# Windows Defender
-# ===============================
+# Cache OS/VM before Defender cmdlets (they break later CIM/WMI queries in the same session)
+$osVerified = $false
+if ($env:OS -eq "Windows_NT") {
+    try {
+        $osInfoEarly = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop | Select-Object -First 1
+        if ($null -ne $osInfoEarly) { $osVerified = $true }
+    } catch {}
+}
+
+$vmDetected = $false
+$vmCheckFailed = $false
+try {
+    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+    if ($cs.Manufacturer -match 'VMware|VirtualBox|innotek|QEMU|Xen|Parallels' -or $cs.Model -match 'Virtual|VMware|VirtualBox') { $vmDetected = $true }
+    if ($cs.Manufacturer -match 'Microsoft' -and $cs.Model -match 'Virtual') { $vmDetected = $true }
+    $bios = Get-CimInstance Win32_BIOS -ErrorAction Stop
+    if ($bios.SMBIOSBIOSVersion -match "VMware|Hyper-V") { $vmDetected = $true }
+    if (Get-Service "*vmware*" -ErrorAction SilentlyContinue) { $vmDetected = $true }
+} catch { $vmCheckFailed = $true }
+
+# ----- Windows Defender -----
 $totalChecks++
 try {
     $def = Get-MpComputerStatus
-    if ($def.RealTimeProtectionEnabled) {
-        $defenderOutput += "SUCCESS: Windows Defender real-time protection enabled."
-        $passedChecks++
-    } else {
-        $defenderOutput += "FAILURE: Windows Defender real-time protection disabled."
-    }
+    if ($def.RealTimeProtectionEnabled) { $defenderOutput += "SUCCESS: Real-time protection on"; $passedChecks++ }
+    else { $defenderOutput += "FAILURE: Real-time protection off" }
 
-    if (-not $def.IsTamperProtected) {
-        $defenderOutput += "WARNING: Tamper protection disabled."
-    }
-} catch {
-    $defenderOutput += "WARNING: Unable to query Defender."
-}
+    if (-not $def.IsTamperProtected) { $defenderOutput += "WARNING: Tamper protection off" }
+} catch { $defenderOutput += "WARNING: Defender unavailable" }
 
 foreach ($disableKey in @(
     'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender',
@@ -896,81 +1073,58 @@ foreach ($disableKey in @(
 )) {
     try {
         $disabled = Get-ItemPropertyValue -Path $disableKey -Name 'DisableAntiSpyware' -ErrorAction Stop
-        if ($disabled -eq 1) { $defenderOutput += "FAILURE: DisableAntiSpyware active." }
+        if ($disabled -eq 1) { $defenderOutput += "FAILURE: DisableAntiSpyware active" }
     } catch {}
 }
 
-# ===============================
-# Defender Exclusions (T2 method: cmdlet + registry)
-# ===============================
+# ----- Defender Exclusions -----
 $totalChecks++
 try {
     $allExclusions = @(Get-Exclusions)
 
     if ($allExclusions.Count -eq 0) {
-        $exclusionsOutput += "SUCCESS: No Defender exclusions."
+        $exclusionsOutput += "SUCCESS: No exclusions"
         $passedChecks++
     } else {
         foreach ($excl in $allExclusions) {
             $exclKw = Get-MatchedCheatKeyword -Text $excl
-            if ($exclKw) {
-                $exclusionsOutput += "FAILURE: Defender exclusion [$exclKw] -> $excl"
-            } else {
-                $exclusionsOutput += "FAILURE: Defender exclusion -> $excl"
-            }
+            if ($exclKw) { $exclusionsOutput += "FAILURE: Exclusion [$exclKw] $excl" }
+            else { $exclusionsOutput += "FAILURE: Exclusion $excl" }
         }
     }
-} catch {
-    $exclusionsOutput += "WARNING: Exclusions check failed."
-}
+} catch { $exclusionsOutput += "WARNING: Exclusions check failed" }
 
-# ===============================
-# Allowed Threats
-# ===============================
+# ----- Allowed Threats -----
 $totalChecks++
 try {
     $allowedThreats = @(Get-AllowedDefenderThreats)
     if ($allowedThreats.Count -eq 0) {
-        $allowedThreatsOutput += "SUCCESS: No allowed threats."
+        $allowedThreatsOutput += "SUCCESS: No allowed threats"
         $passedChecks++
     } else {
         foreach ($threat in $allowedThreats) {
-            $allowedThreatsOutput += "FAILURE: Allowed threat -> $threat"
+            $allowedThreatsOutput += "FAILURE: Allowed threat $threat"
         }
     }
-} catch {
-    $allowedThreatsOutput += "WARNING: Allowed threats check failed."
-}
+} catch { $allowedThreatsOutput += "WARNING: Allowed threats check failed" }
 
-# ===============================
-# Memory Integrity
-# ===============================
+# ----- Memory Integrity -----
 $totalChecks++
 try {
     $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity"
-    $enabled = Get-ItemPropertyValue -Path $regPath -Name Enabled
-    if ($enabled -eq 1) {
-        $memoryIntegrityOutput += "SUCCESS: Memory Integrity enabled."
-        $passedChecks++
-    } else {
-        $memoryIntegrityOutput += "FAILURE: Memory Integrity disabled."
-    }
-} catch {
-    $memoryIntegrityOutput += "WARNING: Memory Integrity status unavailable."
-}
+    $enabled = Get-ItemPropertyValue -Path $regPath -Name "Enabled" -ErrorAction Stop
+    if ($enabled -eq 1) { $memoryIntegrityOutput += "SUCCESS: Memory Integrity on"; $passedChecks++ }
+    else { $memoryIntegrityOutput += "FAILURE: Memory Integrity off" }
+} catch { $memoryIntegrityOutput += "WARNING: Memory Integrity unavailable" }
 
-# ===============================
-# NVIDIA ShadowPlay FTS (streamproof bypass)
-# ===============================
+# ----- NVIDIA ShadowPlay FTS (streamproof bypass) -----
 $totalChecks++
 foreach ($line in (Get-NvidiaShadowPlayFtsAlerts)) {
     $nvidiaOutput += $line
     if ($line -like 'SUCCESS*') { $passedChecks++ }
 }
 
-# ===============================
-# Process Scan
-# ===============================
+# ----- Process Scan -----
 $totalChecks++
 $procHits = @(Get-SuspiciousProcessHits)
 if ($procHits.Count -eq 0) {
@@ -980,9 +1134,7 @@ if ($procHits.Count -eq 0) {
     $processOutput += $procHits
 }
 
-# ===============================
-# KeyAuth Check
-# ===============================
+# ----- KeyAuth -----
 $totalChecks++
 try {
     $keyAuthHits = @()
@@ -1008,35 +1160,241 @@ try {
     $keyAuthOutput += "WARNING: KeyAuth check failed"
 }
 
-# ===============================
-# Display Results
-# ===============================
-Write-Section "Modules" $moduleOutput
-Write-Section "CPU & GPU Detections" $cpuGpuOutput
-Write-Section "Windows Defender" $defenderOutput
-Write-Section "Defender Exclusions" $exclusionsOutput
-Write-Section "Allowed Threats" $allowedThreatsOutput
-Write-Section "Memory Integrity" $memoryIntegrityOutput
+# ----- PowerShell Binary -----
+$totalChecks++
+try {
+    $psPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $sig = Get-AuthenticodeSignature $psPath
+    if ($sig.Status -eq "Valid" -and $sig.SignerCertificate.Subject -like "*Microsoft*") { $powershellSigOutput += "SUCCESS: PowerShell OK"; $passedChecks++ }
+    else { $powershellSigOutput += "FAILURE: PowerShell tampered" }
+} catch { $powershellSigOutput += "WARNING: PowerShell check failed" }
+
+# ----- OS Check -----
+$totalChecks++
+if ($osVerified) { $osOutput += "SUCCESS: OS OK"; $passedChecks++ }
+else { $osOutput += "FAILURE: OS check failed" }
+
+# ----- VM -----
+$totalChecks++
+if ($vmCheckFailed) { $vmOutput += "WARNING: VM check failed" }
+elseif (-not $vmDetected) { $vmOutput += "SUCCESS: Not a VM"; $passedChecks++ }
+else { $vmOutput += "FAILURE: VM detected" }
+
+# ----- Registry -----
+$totalChecks++
+$registryHit = $false
+try {
+    $mui = "HKCU:\SOFTWARE\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache"
+    $entries = Get-ItemProperty -Path $mui -ErrorAction Stop
+    foreach ($prop in $entries.PSObject.Properties) {
+        if ($prop.Name -match '^(PSPath|PSParentPath|PSChildName|PSDrive|PSProvider)$') { continue }
+        $muiKw = Get-MatchedCheatKeyword -Text $prop.Name
+        if ($muiKw) {
+            $registryOutput += "FAILURE: MuiCache [$muiKw] $($prop.Name)"
+            $registryHit = $true
+        }
+    }
+} catch { $registryOutput += "WARNING: MuiCache unavailable" }
+
+try {
+    $uaRoot = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist'
+    if (Test-Path $uaRoot) {
+        Get-ChildItem $uaRoot -ErrorAction SilentlyContinue | ForEach-Object {
+            $countKey = Join-Path $_.PSPath 'Count'
+            if (-not (Test-Path $countKey)) { return }
+            $uaEntries = Get-ItemProperty -Path $countKey -ErrorAction SilentlyContinue
+            if (-not $uaEntries) { return }
+            foreach ($prop in $uaEntries.PSObject.Properties) {
+                if ($prop.Name -match '^(PSPath|PSParentPath|PSChildName|PSDrive|PSProvider)$') { continue }
+                $decoded = Convert-UserAssistName -Name $prop.Name
+                $uaKw = Get-MatchedCheatKeyword -Text $decoded
+                if ($uaKw) {
+                    $registryOutput += "FAILURE: UserAssist [$uaKw] $decoded"
+                    $registryHit = $true
+                }
+            }
+        }
+    }
+} catch {}
+
+if (-not $registryHit -and ($registryOutput -notlike 'WARNING*')) {
+    $registryOutput += "SUCCESS: Registry clean"
+    $passedChecks++
+}
+
+Write-Section "System" ($moduleOutput + $cpuGpuOutput + $osOutput + $vmOutput)
+Write-Section "Defender" ($defenderOutput + $exclusionsOutput + $allowedThreatsOutput + $memoryIntegrityOutput)
 Write-Section "NVIDIA ShadowPlay" $nvidiaOutput
-Write-Section "Process Scan" $processOutput
-Write-Section "KeyAuth Check" $keyAuthOutput
+Write-Section "Processes" $processOutput
+Write-Section "KeyAuth" $keyAuthOutput
+Write-Section "PowerShell" $powershellSigOutput
+Write-Section "Registry" $registryOutput
 
-# ===============================
-# Success Rate
-# ===============================
 if ($totalChecks -ne 0) { $successRate = [math]::Round(($passedChecks / $totalChecks) * 100) } else { $successRate = 0 }
-Write-Host "Overall Success Rate: $successRate%" -ForegroundColor Cyan
+Write-Host "Result: $successRate%" -ForegroundColor Cyan
 Write-Host ""
+Wait-NextStep "[2/6] Press Enter" "[2/6] BAM Key Entries"
 
-Write-Host "Press Enter to continue..." -ForegroundColor Yellow
-[Console]::ReadLine() | Out-Null
+# ----- Admin check -----
+if (-not (Test-Admin)) {
+    Write-Warning "Administrator required."
+    Start-Sleep 2
+    exit
+}
 
-# ===============================
-# STEP 2 – PROCESS EXPLORER
-# ===============================
-Clear-Host
-Write-Host "[ Step 2 of 3 - Process Explorer ]" -ForegroundColor Cyan
-Write-Host ""
+Show-LoadingBar
+
+try {
+    $Bam = @(Get-ActivityModeratorEntries)
+} catch {
+    $Bam = @()
+}
+
+if ($Bam.Count -eq 0) {
+    Write-Host "WARNING: No BAM/DAM entries found" -ForegroundColor Yellow
+}
+
+foreach ($fp in (Get-BamRegistryFingerprints)) { $script:BaselineBamKeys[$fp] = $true }
+
+try {
+    Initialize-WinForms
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "BAM Key Entries ($($Bam.Count))"
+    $form.WindowState = 'Maximized'
+    $form.StartPosition = "CenterScreen"
+
+    $lv = New-Object System.Windows.Forms.ListView
+    $lv.View = 'Details'
+    $lv.FullRowSelect = $true
+    $lv.GridLines = $true
+    $lv.Dock = 'Fill'
+    $lv.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+    $lv.ForeColor = [System.Drawing.Color]::Black
+    $lv.BackColor = [System.Drawing.Color]::White
+
+    $lv.Columns.Add("Examiner Time", 200) | Out-Null
+    $lv.Columns.Add("Last Execution Time", 200) | Out-Null
+    $lv.Columns.Add("Application", 300) | Out-Null
+    $lv.Columns.Add("Path", 700) | Out-Null
+    $lv.Columns.Add("Signature", 200) | Out-Null
+
+    $lv.BeginUpdate()
+    try {
+        foreach ($r in $Bam) {
+            $item = New-Object System.Windows.Forms.ListViewItem($r.'Examiner Time')
+            $item.SubItems.Add($r.'Last Execution Time') | Out-Null
+            $item.SubItems.Add($r.Application) | Out-Null
+            $item.SubItems.Add($r.Path) | Out-Null
+            $item.SubItems.Add($r.Signature) | Out-Null
+            $lv.Items.Add($item) | Out-Null
+        }
+    } finally {
+        $lv.EndUpdate()
+    }
+
+    $form.Controls.Add($lv)
+
+    $form.Add_Shown({
+        $used = 0
+        for ($i = 0; $i -lt ($lv.Columns.Count - 1); $i++) {
+            $used += $lv.Columns[$i].Width
+        }
+        $remaining = $lv.ClientSize.Width - $used - 5
+        if ($remaining -gt 100) {
+            $lv.Columns[$lv.Columns.Count - 1].Width = $remaining
+        }
+    })
+
+    [void]$form.ShowDialog()
+} catch {
+    Write-Warning "BAM viewer failed: $($_.Exception.Message)"
+}
+
+Wait-NextStep "[3/6] Press Enter" "[3/6] Prefetch Viewer"
+Show-LoadingBar
+
+function Launch-PrefetchViewer {
+    Initialize-WinForms
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Prefetch Viewer"
+    $form.WindowState = 'Maximized'
+    $form.StartPosition = "CenterScreen"
+
+    $listView = New-Object System.Windows.Forms.ListView
+    $listView.View = [System.Windows.Forms.View]::Details
+    $listView.FullRowSelect = $true
+    $listView.GridLines = $true
+    $listView.Dock = 'Fill'
+    $listView.MultiSelect = $false
+
+    $listView.Columns.Add("Prefetch File Name", 400) | Out-Null
+    $listView.Columns.Add("Size (KB)", 100) | Out-Null
+    $listView.Columns.Add("Last Access Time", 250) | Out-Null
+    $listView.Columns.Add("Last Run Time", 250) | Out-Null
+
+    $form.Controls.Add($listView) | Out-Null
+
+    $prefetchPath = "$env:WINDIR\Prefetch"
+    if (-Not (Test-Path $prefetchPath)) {
+        [System.Windows.Forms.MessageBox]::Show("Prefetch folder not found.","Error",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        return
+    }
+
+    $prefetchFiles = @()
+    try {
+        $prefetchFiles = @(Get-ChildItem -Path $prefetchPath -Filter "*.pf" -ErrorAction Stop)
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Cannot read Prefetch. Run as Administrator.","Prefetch",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+    }
+
+    if ($prefetchFiles.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("No prefetch files found.","Prefetch",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    } else {
+        foreach ($name in $prefetchFiles.Name) { $script:BaselinePrefetchFiles[$name] = $true }
+    }
+
+    $rows = foreach ($file in $prefetchFiles) {
+        [PSCustomObject]@{
+            Name       = $file.Name
+            SizeKb     = ([math]::Round($file.Length / 1KB, 2)).ToString()
+            AccessTime = $file.LastAccessTime.ToString("yyyy-MM-dd HH:mm:ss")
+            RunTime    = Get-PrefetchLastRunTime -FilePath $file.FullName
+        }
+    }
+
+    $listView.BeginUpdate()
+    try {
+        foreach ($row in $rows) {
+            $item = New-Object System.Windows.Forms.ListViewItem($row.Name)
+            $item.SubItems.Add($row.SizeKb) | Out-Null
+            $item.SubItems.Add($row.AccessTime) | Out-Null
+            $item.SubItems.Add($row.RunTime) | Out-Null
+            $listView.Items.Add($item) | Out-Null
+        }
+    } finally {
+        $listView.EndUpdate()
+    }
+
+    $listView.Add_DoubleClick({
+        if ($listView.SelectedItems.Count -gt 0) {
+            $selectedFile = $listView.SelectedItems[0].Text
+            Start-Process "$prefetchPath\$selectedFile" | Out-Null
+        }
+    })
+
+    [void]$form.ShowDialog()
+}
+
+try {
+    Launch-PrefetchViewer
+} catch {
+    Write-Warning "Prefetch viewer failed: $($_.Exception.Message)"
+}
+
+Wait-NextStep "[4/6] Press Enter" "[4/6] Process Explorer"
+Show-LoadingBar
 
 $procDir = "$env:TEMP\ProcessExplorer"
 $procExe = "$procDir\procexp64.exe"
@@ -1050,37 +1408,42 @@ if (-not (Test-Path $procExe)) {
 }
 
 if (Test-Path $procExe) {
-    Write-Host "Launching Process Explorer..." -ForegroundColor Green
-    Write-Host ""
-    $proc = Start-Process -FilePath $procExe -ArgumentList "/accepteula" -PassThru
-    Wait-Process -Id $proc.Id
-    Write-Host ""
-    Write-Host "Process Explorer closed." -ForegroundColor Cyan
-} else {
-    Write-Host "WARNING: Process Explorer not found." -ForegroundColor Yellow
+    $proc = Start-Process -FilePath $procExe -PassThru
+    $proc.WaitForExit()
 }
 
-Write-Host "Press Enter to continue..." -ForegroundColor Yellow
-[Console]::ReadLine() | Out-Null
+Wait-NextStep "[5/6] Press Enter" "[5/6] Last Activity Viewer"
+Show-LoadingBar
 
-# ===============================
-# STEP 3 – LIVE MONITOR
-# ===============================
-Clear-Host
-Write-Host "[ Step 3 of 3 - Live Monitor ]" -ForegroundColor Cyan
-Write-Host ""
+$lastActivityDir = "$env:TEMP\LastActivity"
+$lastActivityExe = "$lastActivityDir\LastActivityView.exe"
+
+if (-not (Test-Path $lastActivityExe)) {
+    $lastActivityURL = "https://www.nirsoft.net/utils/lastactivityview.zip"
+    $lastActivityZip = "$env:TEMP\LastActivityView.zip"
+    if (-not (Invoke-ToolDownload -Url $lastActivityURL -ZipPath $lastActivityZip -DestDir $lastActivityDir)) {
+        Write-Host "WARNING: Last Activity Viewer unavailable" -ForegroundColor Yellow
+    }
+}
+
+if (Test-Path $lastActivityExe) {
+    Start-Process -FilePath $lastActivityExe -WindowStyle Maximized
+}
+
+Wait-NextStep "[6/6] Press Enter" "[6/6] Live Monitor"
+Show-LoadingBar
 Write-Host "Keep this window open during the match. Must show again after match." -ForegroundColor Yellow
 Write-Host ""
 
-$logFile = Join-Path $env:ProgramData 'loc_tier1_security_events.log'
+$logFile = Join-Path $env:ProgramData 'loc_tier2_security_events.log'
 try {
     if (-not (Test-Path $logFile)) { New-Item -Path $logFile -ItemType File -Force | Out-Null }
-    Write-MonitorAlert -Message "LOC Tier 1 v$($script:LocTier1Version) monitor started" -LogFile $logFile
+    Write-MonitorAlert -Message "LOC Tier 2 v$($script:LocTier2Version) monitor started" -LogFile $logFile
 } catch {
-    $logFile = Join-Path $env:TEMP 'loc_tier1_security_events.log'
+    $logFile = Join-Path $env:TEMP 'loc_tier2_security_events.log'
     if (-not (Test-Path $logFile)) { New-Item -Path $logFile -ItemType File -Force | Out-Null }
     Write-Host "WARNING: Logging to $logFile" -ForegroundColor Yellow
-    Write-MonitorAlert -Message "LOC Tier 1 v$($script:LocTier1Version) monitor started" -LogFile $logFile
+    Write-MonitorAlert -Message "LOC Tier 2 v$($script:LocTier2Version) monitor started" -LogFile $logFile
 }
 
 Register-WmiEvent -Class Win32_VolumeChangeEvent -SourceIdentifier USBChange | Out-Null
@@ -1089,9 +1452,6 @@ trap {
         Unregister-Event -Force -ErrorAction SilentlyContinue
     break
 }
-
-foreach ($fp in (Get-BamRegistryFingerprints)) { $script:BaselineBamKeys[$fp] = $true }
-foreach ($pf in (Get-PrefetchFileNames)) { $script:BaselinePrefetchFiles[$pf] = $true }
 
 $previousExclusions = @{}
 foreach ($ex in (Get-Exclusions)) { $previousExclusions[$ex] = $true }
@@ -1232,25 +1592,6 @@ while ($true) {
         } catch {}
     }
 
-    $folderScanCounter++
-    if ($folderScanCounter -ge 30) {
-        $folderScanCounter = 0
-        foreach ($folder in (Get-CheatFolderHits)) {
-            if (-not $knownCheatFolders.ContainsKey($folder)) {
-                $knownCheatFolders[$folder] = $true
-                Write-MonitorAlert -Message "Cheat folder: $folder" -LogFile $logFile -Color Red
-            }
-        }
-    }
-
-    $processChangeCounter++
-    if ($processChangeCounter -ge 3) {
-        $processChangeCounter = 0
-        $currentProcessSnapshot = Get-ProcessSnapshot
-        Update-ProcessChangeMonitor -Previous $lastProcessSnapshot -Current $currentProcessSnapshot -Watched $watchedProcesses -LogFile $logFile
-        $lastProcessSnapshot = $currentProcessSnapshot
-    }
-
     $nvidiaScanCounter++
     if ($nvidiaScanCounter -ge 5) {
         $nvidiaScanCounter = 0
@@ -1281,6 +1622,25 @@ while ($true) {
                 }
             }
         }
+    }
+
+    $folderScanCounter++
+    if ($folderScanCounter -ge 30) {
+        $folderScanCounter = 0
+        foreach ($folder in (Get-CheatFolderHits)) {
+            if (-not $knownCheatFolders.ContainsKey($folder)) {
+                $knownCheatFolders[$folder] = $true
+                Write-MonitorAlert -Message "Cheat folder: $folder" -LogFile $logFile -Color Red
+            }
+        }
+    }
+
+    $processChangeCounter++
+    if ($processChangeCounter -ge 3) {
+        $processChangeCounter = 0
+        $currentProcessSnapshot = Get-ProcessSnapshot
+        Update-ProcessChangeMonitor -Previous $lastProcessSnapshot -Current $currentProcessSnapshot -Watched $watchedProcesses -LogFile $logFile
+        $lastProcessSnapshot = $currentProcessSnapshot
     }
 
     $deletionScanCounter++
