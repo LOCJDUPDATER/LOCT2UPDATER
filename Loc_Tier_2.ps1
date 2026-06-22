@@ -1,14 +1,20 @@
 Clear-Host
 
 if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+    $hostExe = (Get-Process -Id $PID).Path
     if ($PSCommandPath) {
-        $hostExe = (Get-Process -Id $PID).Path
         $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', "`"$PSCommandPath`"")
         Start-Process -FilePath $hostExe -ArgumentList $argList -Wait | Out-Null
         exit
-    } else {
-        Write-Warning "WinForms steps need STA mode. Use: powershell -STA -File `"<script.ps1>`""
     }
+    $tempScript = Join-Path $env:TEMP 'Loc_Tier_2.ps1'
+    try {
+        Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/LOCJDUPDATER/LOCT2UPDATER/main/Loc_Tier_2.ps1' -OutFile $tempScript -UseBasicParsing
+        Start-Process -FilePath $hostExe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', "`"$tempScript`"") -Wait | Out-Null
+    } catch {
+        Write-Warning "WinForms steps need STA mode. Use: powershell -STA -ExecutionPolicy Bypass -File `"<script.ps1>`""
+    }
+    exit
 }
 
 $script:WinFormsLoaded = $false
@@ -27,7 +33,7 @@ function Test-Admin {
     return $p.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 }
 
-$script:LocTier2Version = '2.5.0'
+$script:LocTier2Version = '2.5.2'
 
 function Open-LocalMachineRegistryKey {
     param([string]$SubKeyPath)
@@ -437,6 +443,61 @@ function Get-RegistryToolProcessHits {
     }
 
     return $messages
+}
+
+$script:WindhawkProcessName = 'windhawk.exe'
+$script:WindhawkWatchPaths = @(
+    'C:\Users\Stef\Downloads\windhawk.exe',
+    (Join-Path $env:USERPROFILE 'Downloads\windhawk.exe'),
+    (Join-Path ${env:ProgramFiles} 'Windhawk\windhawk.exe'),
+    (Join-Path ${env:ProgramFiles(x86)} 'Windhawk\windhawk.exe'),
+    (Join-Path $env:LOCALAPPDATA 'Programs\Windhawk\windhawk.exe')
+)
+
+function Get-WindhawkProcessHits {
+    $seen = New-Object 'System.Collections.Generic.HashSet[int]'
+    $messages = @()
+
+    try {
+        Get-CimInstance Win32_Process -Filter "Name='$($script:WindhawkProcessName)'" -ErrorAction Stop | ForEach-Object {
+            $procId = [int]$_.ProcessId
+            if (-not $seen.Add($procId)) { return }
+            $path = [string]$_.ExecutablePath
+            $label = "$($script:WindhawkProcessName) (PID $procId)"
+            if ($path) { $label += " -> $path" }
+            $messages += $label
+        }
+    } catch {}
+
+    return $messages
+}
+
+function Get-WindhawkStep1Alerts {
+    $alerts = @()
+    $hits = @(Get-WindhawkProcessHits)
+
+    if ($hits.Count -gt 0) {
+        foreach ($hit in $hits) {
+            $alerts += "FAILURE: Windhawk running $hit"
+        }
+        return $alerts
+    }
+
+    $foundPaths = @()
+    foreach ($p in ($script:WindhawkWatchPaths | Select-Object -Unique)) {
+        if ($p -and (Test-Path -LiteralPath $p -ErrorAction SilentlyContinue)) {
+            $foundPaths += $p
+        }
+    }
+    if ($foundPaths.Count -gt 0) {
+        foreach ($p in $foundPaths) {
+            $alerts += "WARNING: Windhawk found $p"
+        }
+        return $alerts
+    }
+
+    $alerts += 'SUCCESS: Windhawk not detected'
+    return $alerts
 }
 
 function Get-PrefetchLastRunTime {
@@ -1010,6 +1071,7 @@ $allowedThreatsOutput = @()
 $memoryIntegrityOutput = @()
 $registryOutput = @()
 $nvidiaOutput = @()
+$windhawkOutput = @()
 
 # ----- Module Check -----
 $modules = @("Microsoft.PowerShell.Operation.Validation","PackageManagement","Pester","PowerShellGet","PSReadline")
@@ -1160,6 +1222,13 @@ try {
     $keyAuthOutput += "WARNING: KeyAuth check failed"
 }
 
+# ----- Windhawk -----
+$totalChecks++
+foreach ($line in (Get-WindhawkStep1Alerts)) {
+    $windhawkOutput += $line
+    if ($line -like 'SUCCESS*') { $passedChecks++ }
+}
+
 # ----- PowerShell Binary -----
 $totalChecks++
 try {
@@ -1227,6 +1296,7 @@ Write-Section "Defender" ($defenderOutput + $exclusionsOutput + $allowedThreatsO
 Write-Section "NVIDIA ShadowPlay" $nvidiaOutput
 Write-Section "Processes" $processOutput
 Write-Section "KeyAuth" $keyAuthOutput
+Write-Section "Windhawk" $windhawkOutput
 Write-Section "PowerShell" $powershellSigOutput
 Write-Section "Registry" $registryOutput
 
@@ -1471,6 +1541,7 @@ $reportedNvidiaFtsChanges = @{}
 $reportedNvidiaStreamproof = @{}
 $reportedDefenderStatus = @{}
 $reportedRegistryTools = @{}
+$reportedWindhawkHits = @{}
 $reportedDefenderRegChanges = @{}
 $baselineDefenderReg = Get-DefenderRegistryFingerprints
 $defenderRegLabels = Get-DefenderRegistryMonitorLabels
@@ -1497,6 +1568,11 @@ foreach ($line in (Get-DefenderStatusAlerts)) {
         $color = if ($line -like 'FAILURE*') { 'Red' } else { 'Yellow' }
         Write-MonitorAlert -Message $line -LogFile $logFile -Color $color
     }
+}
+
+foreach ($hit in (Get-WindhawkProcessHits)) {
+    $reportedWindhawkHits[$hit] = $true
+    Write-MonitorAlert -Message "Windhawk: $hit" -LogFile $logFile -Color Red
 }
 
 while ($true) {
@@ -1559,6 +1635,13 @@ while ($true) {
             if (-not $reportedRegistryTools.ContainsKey($hit)) {
                 $reportedRegistryTools[$hit] = $true
                 Write-MonitorAlert -Message "Registry tool: $hit" -LogFile $logFile -Color Red
+            }
+        }
+
+        foreach ($hit in (Get-WindhawkProcessHits)) {
+            if (-not $reportedWindhawkHits.ContainsKey($hit)) {
+                $reportedWindhawkHits[$hit] = $true
+                Write-MonitorAlert -Message "Windhawk: $hit" -LogFile $logFile -Color Red
             }
         }
     }
