@@ -27,6 +27,52 @@ function Test-Admin {
     return $p.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 }
 
+$script:LocTier2Version = '2.5.0'
+
+function Open-LocalMachineRegistryKey {
+    param([string]$SubKeyPath)
+
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+            [Microsoft.Win32.RegistryHive]::LocalMachine,
+            [Microsoft.Win32.RegistryView]::Registry64
+        )
+        if ([string]::IsNullOrWhiteSpace($SubKeyPath)) { return $base }
+        return $base.OpenSubKey($SubKeyPath)
+    } catch {
+        return $null
+    }
+}
+
+function Add-RegistryKeyFingerprint {
+    param(
+        [Microsoft.Win32.RegistryKey]$Key,
+        [string]$Prefix,
+        [System.Collections.Generic.List[string]]$Parts
+    )
+
+    foreach ($name in $Key.GetValueNames()) {
+        $raw = $Key.GetValue($name)
+        if ($null -eq $raw) {
+            $Parts.Add("$Prefix|$name=")
+        } elseif ($raw -is [byte[]]) {
+            $Parts.Add("$Prefix|$name=0x$([BitConverter]::ToString($raw).Replace('-', ''))")
+        } else {
+            $Parts.Add("$Prefix|$name=$raw")
+        }
+    }
+
+    foreach ($subName in $Key.GetSubKeyNames()) {
+        $subKey = $Key.OpenSubKey($subName)
+        if ($subKey) {
+            Add-RegistryKeyFingerprint -Key $subKey -Prefix "$Prefix\$subName" -Parts $Parts
+            $subKey.Close()
+        } else {
+            $Parts.Add("$Prefix\$subName=<missing>")
+        }
+    }
+}
+
 # ===============================
 # ASCII Banner (LOC RECORDING POLICY T2)
 # ===============================
@@ -40,6 +86,8 @@ Write-Host '|  _ \ / _ \| |   |_ _/ ___\ \ / / |_   _|___ \ ' -ForegroundColor C
 Write-Host '| |_) | | | | |    | | |    \ V /    | |   __) |' -ForegroundColor Cyan
 Write-Host '|  __/| |_| | |___ | | |___  | |     | |  / __/ ' -ForegroundColor Cyan
 Write-Host '|_|    \___/|_____|___\____| |_|     |_| |_____|' -ForegroundColor Cyan
+Write-Host ""
+Write-Host "LOC Tier 2 v$($script:LocTier2Version)" -ForegroundColor White
 Write-Host ""
 if (-not (Test-Admin)) {
     Write-Host "WARNING: Run as Administrator for full results." -ForegroundColor Yellow
@@ -127,7 +175,7 @@ function Get-ActivityModeratorEntries {
     )
 
     foreach ($root in $roots) {
-        $rootKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($root)
+        $rootKey = Open-LocalMachineRegistryKey -SubKeyPath $root
         if (-not $rootKey) { continue }
 
         foreach ($sidName in $rootKey.GetSubKeyNames()) {
@@ -240,7 +288,7 @@ function Get-Exclusions {
     foreach ($root in $regRoots) {
         foreach ($type in $regTypes) {
             try {
-                $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("$root\$type")
+                $key = Open-LocalMachineRegistryKey -SubKeyPath "$root\$type"
                 if (-not $key) { continue }
                 foreach ($name in $key.GetValueNames()) {
                     if ($name) { [void]$list.Add($name) }
@@ -251,6 +299,144 @@ function Get-Exclusions {
     }
 
     return @($list)
+}
+
+$script:DefenderExclusionsRegRoots = @(
+    'SOFTWARE\Microsoft\Windows Defender\Exclusions',
+    'SOFTWARE\Policies\Microsoft\Windows Defender\Exclusions'
+)
+$script:DefenderThreatsRegRoots = @(
+    'SOFTWARE\Microsoft\Windows Defender\Threats',
+    'SOFTWARE\Policies\Microsoft\Windows Defender\Threats'
+)
+$script:DefenderThreatsSystemSubkeys = @(
+    'ThreatSeverityDefaultAction',
+    'ThreatIDDefaultAction',
+    'ThreatTypeDefaultAction'
+)
+
+function Get-RegistrySubtreeFingerprint {
+    param([string]$RelativePath)
+
+    $parts = New-Object 'System.Collections.Generic.List[string]'
+
+    try {
+        $root = Open-LocalMachineRegistryKey -SubKeyPath $RelativePath
+        if (-not $root) { return 'MISSING' }
+        Add-RegistryKeyFingerprint -Key $root -Prefix $RelativePath -Parts $parts
+        $root.Close()
+    } catch {
+        return 'ERROR'
+    }
+
+    if ($parts.Count -eq 0) { return 'EMPTY' }
+    return ($parts | Sort-Object) -join '|'
+}
+
+function Get-DefenderRegistryMonitorLabels {
+    $labels = @{}
+    foreach ($root in $script:DefenderExclusionsRegRoots) {
+        $labels[$root] = "Defender Exclusions registry ($root)"
+    }
+    foreach ($root in $script:DefenderThreatsRegRoots) {
+        $labels[$root] = "Defender Threats registry ($root)"
+    }
+    return $labels
+}
+
+function Get-DefenderRegistryFingerprints {
+    $fps = @{}
+    foreach ($root in ($script:DefenderExclusionsRegRoots + $script:DefenderThreatsRegRoots)) {
+        $fps[$root] = Get-RegistrySubtreeFingerprint -RelativePath $root
+    }
+    return $fps
+}
+
+function Get-AllowedDefenderThreats {
+    $list = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($relPath in @(
+        'SOFTWARE\Microsoft\Windows Defender\Exclusions\Threats',
+        'SOFTWARE\Policies\Microsoft\Windows Defender\Exclusions\Threats'
+    )) {
+        try {
+            $key = Open-LocalMachineRegistryKey -SubKeyPath $relPath
+            if (-not $key) { continue }
+            foreach ($name in $key.GetValueNames()) {
+                if ($name) { [void]$list.Add("$relPath -> $name") }
+            }
+            foreach ($subName in $key.GetSubKeyNames()) {
+                [void]$list.Add("$relPath\$subName")
+            }
+            $key.Close()
+        } catch {}
+    }
+
+    foreach ($root in $script:DefenderThreatsRegRoots) {
+        try {
+            $key = Open-LocalMachineRegistryKey -SubKeyPath $root
+            if (-not $key) { continue }
+            foreach ($subName in $key.GetSubKeyNames()) {
+                if ($script:DefenderThreatsSystemSubkeys -contains $subName) { continue }
+                if ($subName -match '(?i)^\{?[0-9A-F-]{36}\}?$|^\d+$') {
+                    [void]$list.Add("$root\$subName")
+                }
+            }
+            $key.Close()
+        } catch {}
+    }
+
+    return @($list)
+}
+
+function Get-DefenderStatusAlerts {
+    $alerts = @()
+
+    try {
+        $def = Get-MpComputerStatus -ErrorAction Stop
+        if (-not $def.RealTimeProtectionEnabled) {
+            $alerts += 'FAILURE: Real-time protection disabled'
+        }
+        if (-not $def.IsTamperProtected) {
+            $alerts += 'WARNING: Tamper protection disabled'
+        }
+    } catch {
+        $alerts += 'WARNING: Defender status unavailable'
+    }
+
+    foreach ($disableKey in @(
+        'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender',
+        'HKLM:\SOFTWARE\Microsoft\Windows Defender'
+    )) {
+        try {
+            $disabled = Get-ItemPropertyValue -Path $disableKey -Name 'DisableAntiSpyware' -ErrorAction Stop
+            if ($disabled -eq 1) { $alerts += 'FAILURE: DisableAntiSpyware active' }
+        } catch {}
+    }
+
+    return $alerts
+}
+
+function Get-RegistryToolProcessHits {
+    $seen = New-Object 'System.Collections.Generic.HashSet[int]'
+    $messages = @()
+
+    foreach ($procName in @('regedit.exe', 'reg.exe')) {
+        try {
+            Get-CimInstance Win32_Process -Filter "Name='$procName'" -ErrorAction Stop | ForEach-Object {
+                $procId = [int]$_.ProcessId
+                if (-not $seen.Add($procId)) { return }
+                $path = [string]$_.ExecutablePath
+                $cmd = [string]$_.CommandLine
+                $label = "$procName (PID $procId)"
+                if ($path) { $label += " -> $path" }
+                if ($cmd) { $label += " [$cmd]" }
+                $messages += $label
+            }
+        } catch {}
+    }
+
+    return $messages
 }
 
 function Get-PrefetchLastRunTime {
@@ -300,7 +486,7 @@ function Get-BamRegistryFingerprints {
 
     foreach ($root in $roots) {
         try {
-            $rootKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($root)
+            $rootKey = Open-LocalMachineRegistryKey -SubKeyPath $root
             if (-not $rootKey) { continue }
 
             foreach ($sidName in $rootKey.GetSubKeyNames()) {
@@ -471,7 +657,7 @@ function Get-NvidiaShadowPlayFtsState {
     }
 
     try {
-        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($script:NvidiaShadowPlayFtsRegPath)
+        $key = Open-LocalMachineRegistryKey -SubKeyPath $script:NvidiaShadowPlayFtsRegPath
         if (-not $key) { return $state }
 
         $state.Exists = $true
@@ -820,6 +1006,7 @@ $osOutput = @()
 $vmOutput = @()
 $defenderOutput = @()
 $exclusionsOutput = @()
+$allowedThreatsOutput = @()
 $memoryIntegrityOutput = @()
 $registryOutput = @()
 $nvidiaOutput = @()
@@ -906,6 +1093,20 @@ try {
         }
     }
 } catch { $exclusionsOutput += "WARNING: Exclusions check failed" }
+
+# ----- Allowed Threats -----
+$totalChecks++
+try {
+    $allowedThreats = @(Get-AllowedDefenderThreats)
+    if ($allowedThreats.Count -eq 0) {
+        $allowedThreatsOutput += "SUCCESS: No allowed threats"
+        $passedChecks++
+    } else {
+        foreach ($threat in $allowedThreats) {
+            $allowedThreatsOutput += "FAILURE: Allowed threat $threat"
+        }
+    }
+} catch { $allowedThreatsOutput += "WARNING: Allowed threats check failed" }
 
 # ----- Memory Integrity -----
 $totalChecks++
@@ -1022,7 +1223,7 @@ if (-not $registryHit -and ($registryOutput -notlike 'WARNING*')) {
 }
 
 Write-Section "System" ($moduleOutput + $cpuGpuOutput + $osOutput + $vmOutput)
-Write-Section "Defender" ($defenderOutput + $exclusionsOutput + $memoryIntegrityOutput)
+Write-Section "Defender" ($defenderOutput + $exclusionsOutput + $allowedThreatsOutput + $memoryIntegrityOutput)
 Write-Section "NVIDIA ShadowPlay" $nvidiaOutput
 Write-Section "Processes" $processOutput
 Write-Section "KeyAuth" $keyAuthOutput
@@ -1234,13 +1435,15 @@ Show-LoadingBar
 Write-Host "Keep this window open during the match. Must show again after match." -ForegroundColor Yellow
 Write-Host ""
 
-$logFile = "$env:ProgramData\security_events.log"
+$logFile = Join-Path $env:ProgramData 'loc_tier2_security_events.log'
 try {
     if (-not (Test-Path $logFile)) { New-Item -Path $logFile -ItemType File -Force | Out-Null }
+    Write-MonitorAlert -Message "LOC Tier 2 v$($script:LocTier2Version) monitor started" -LogFile $logFile
 } catch {
     $logFile = Join-Path $env:TEMP 'loc_tier2_security_events.log'
     if (-not (Test-Path $logFile)) { New-Item -Path $logFile -ItemType File -Force | Out-Null }
     Write-Host "WARNING: Logging to $logFile" -ForegroundColor Yellow
+    Write-MonitorAlert -Message "LOC Tier 2 v$($script:LocTier2Version) monitor started" -LogFile $logFile
 }
 
 Register-WmiEvent -Class Win32_VolumeChangeEvent -SourceIdentifier USBChange | Out-Null
@@ -1265,6 +1468,12 @@ $reportedMainCplHits = @{}
 $baselineCursorScheme = Get-CursorSchemeState
 $baselineNvidiaFts = Get-NvidiaShadowPlayFtsFingerprint
 $reportedNvidiaFtsChanges = @{}
+$reportedNvidiaStreamproof = @{}
+$reportedDefenderStatus = @{}
+$reportedRegistryTools = @{}
+$reportedDefenderRegChanges = @{}
+$baselineDefenderReg = Get-DefenderRegistryFingerprints
+$defenderRegLabels = Get-DefenderRegistryMonitorLabels
 $lastProcessSnapshot = Get-ProcessSnapshot
 $watchedProcesses = @{}
 $monitoringStart = Get-Date
@@ -1272,6 +1481,23 @@ $folderScanCounter = 0
 $deletionScanCounter = 0
 $processChangeCounter = 0
 $mainCplScanCounter = 0
+$nvidiaScanCounter = 0
+$defenderScanCounter = 0
+
+foreach ($line in (Get-NvidiaShadowPlayFtsAlerts)) {
+    if ($line -like 'FAILURE*') {
+        $reportedNvidiaStreamproof[$line] = $true
+        Write-MonitorAlert -Message $line -LogFile $logFile -Color Red
+    }
+}
+
+foreach ($line in (Get-DefenderStatusAlerts)) {
+    if ($line -like 'FAILURE*' -or $line -like 'WARNING*') {
+        $reportedDefenderStatus[$line] = $true
+        $color = if ($line -like 'FAILURE*') { 'Red' } else { 'Yellow' }
+        Write-MonitorAlert -Message $line -LogFile $logFile -Color $color
+    }
+}
 
 while ($true) {
     $usbEvent = Wait-Event -SourceIdentifier USBChange -Timeout 1
@@ -1326,6 +1552,74 @@ while ($true) {
             if (-not $reportedMainCplHits.ContainsKey($hit)) {
                 $reportedMainCplHits[$hit] = $true
                 Write-MonitorAlert -Message $hit -LogFile $logFile -Color Yellow
+            }
+        }
+
+        foreach ($hit in (Get-RegistryToolProcessHits)) {
+            if (-not $reportedRegistryTools.ContainsKey($hit)) {
+                $reportedRegistryTools[$hit] = $true
+                Write-MonitorAlert -Message "Registry tool: $hit" -LogFile $logFile -Color Red
+            }
+        }
+    }
+
+    $defenderScanCounter++
+    if ($defenderScanCounter -ge 5) {
+        $defenderScanCounter = 0
+
+        try {
+            foreach ($line in (Get-DefenderStatusAlerts)) {
+                if (-not $reportedDefenderStatus.ContainsKey($line)) {
+                    $reportedDefenderStatus[$line] = $true
+                    $color = if ($line -like 'FAILURE*') { 'Red' } else { 'Yellow' }
+                    Write-MonitorAlert -Message $line -LogFile $logFile -Color $color
+                }
+            }
+
+            foreach ($entry in (Get-DefenderRegistryFingerprints).GetEnumerator()) {
+                $root = $entry.Key
+                $currentFp = $entry.Value
+                $baselineFp = $baselineDefenderReg[$root]
+                if ($currentFp -eq $baselineFp) { continue }
+
+                $changeKey = "$root|$currentFp"
+                if ($reportedDefenderRegChanges.ContainsKey($changeKey)) { continue }
+                $reportedDefenderRegChanges[$changeKey] = $true
+
+                $label = if ($defenderRegLabels.ContainsKey($root)) { $defenderRegLabels[$root] } else { $root }
+                Write-MonitorAlert -Message "$label changed: $currentFp" -LogFile $logFile -Color Red
+            }
+        } catch {}
+    }
+
+    $nvidiaScanCounter++
+    if ($nvidiaScanCounter -ge 5) {
+        $nvidiaScanCounter = 0
+
+        foreach ($line in (Get-NvidiaShadowPlayFtsAlerts)) {
+            if ($line -like 'FAILURE*') {
+                if (-not $reportedNvidiaStreamproof.ContainsKey($line)) {
+                    $reportedNvidiaStreamproof[$line] = $true
+                    Write-MonitorAlert -Message $line -LogFile $logFile -Color Red
+                }
+            } elseif ($line -like 'WARNING*') {
+                $warnKey = "warn|$line"
+                if (-not $reportedNvidiaStreamproof.ContainsKey($warnKey)) {
+                    $reportedNvidiaStreamproof[$warnKey] = $true
+                    Write-MonitorAlert -Message $line -LogFile $logFile -Color Yellow
+                }
+            }
+        }
+
+        $currentNvidiaFts = Get-NvidiaShadowPlayFtsFingerprint
+        if ($currentNvidiaFts -ne $baselineNvidiaFts -and -not $reportedNvidiaFtsChanges.ContainsKey($currentNvidiaFts)) {
+            $reportedNvidiaFtsChanges[$currentNvidiaFts] = $true
+            Write-MonitorAlert -Message "NVIDIA ShadowPlay FTS changed: $currentNvidiaFts" -LogFile $logFile -Color Red
+            foreach ($line in (Get-NvidiaShadowPlayFtsAlerts)) {
+                if ($line -like 'FAILURE*') {
+                    $reportedNvidiaStreamproof[$line] = $true
+                    Write-MonitorAlert -Message $line -LogFile $logFile -Color Red
+                }
             }
         }
     }
@@ -1386,17 +1680,6 @@ while ($true) {
             if ($reportedTamperEvents.ContainsKey($eventKey)) { continue }
             $reportedTamperEvents[$eventKey] = $true
             Write-MonitorAlert -Message "Log cleared ($($ev.Id))" -LogFile $logFile -Color Red
-        }
-
-        $currentNvidiaFts = Get-NvidiaShadowPlayFtsFingerprint
-        if ($currentNvidiaFts -ne $baselineNvidiaFts -and -not $reportedNvidiaFtsChanges.ContainsKey($currentNvidiaFts)) {
-            $reportedNvidiaFtsChanges[$currentNvidiaFts] = $true
-            Write-MonitorAlert -Message "NVIDIA ShadowPlay FTS changed: $currentNvidiaFts" -LogFile $logFile -Color Red
-            foreach ($line in (Get-NvidiaShadowPlayFtsAlerts)) {
-                if ($line -like 'FAILURE*') {
-                    Write-MonitorAlert -Message $line -LogFile $logFile -Color Red
-                }
-            }
         }
     }
 }
