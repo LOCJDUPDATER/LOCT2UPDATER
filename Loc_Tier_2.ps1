@@ -33,7 +33,7 @@ function Test-Admin {
     return $p.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 }
 
-$script:LocTier2Version = '2.6.3'
+$script:LocTier2Version = '2.6.4'
 
 function Open-LocalMachineRegistryKey {
     param([string]$SubKeyPath)
@@ -807,7 +807,53 @@ function Get-CursorSchemeChanges {
 
 $script:NvidiaShadowPlayFtsRegPath = 'SOFTWARE\NVIDIA Corporation\Global\NvApp\ShadowPlay\FTS'
 $script:NvidiaStreamproofGuid = '497B8458-4244-4EE6-BFEA-F3D2BA294F21'
-$script:NvidiaStreamproofValues = @(36, 0x24)
+$script:NvidiaStreamproofValues = @(36)
+
+function Test-NvidiaStreamproofBypassActive {
+    param($State)
+
+    if (-not $State.Exists) { return $false }
+
+    foreach ($entry in $State.Values.GetEnumerator()) {
+        $nameNorm = $entry.Key.Trim('{}').ToLower()
+        if ($nameNorm -ne $script:NvidiaStreamproofGuid.ToLower()) { continue }
+        if ($entry.Value -isnot [int]) { continue }
+        if ($script:NvidiaStreamproofValues -contains $entry.Value) { return $true }
+    }
+
+    return $false
+}
+
+function Get-NvidiaShadowPlayFtsAlerts {
+    $alerts = @()
+    $state = Get-NvidiaShadowPlayFtsState
+    $nvidiaGpu = Test-NvidiaGpuPresent
+
+    if (-not $nvidiaGpu) {
+        $alerts += 'SUCCESS: NVIDIA ShadowPlay N/A'
+        return $alerts
+    }
+
+    if (-not $state.Exists) {
+        $alerts += 'SUCCESS: ShadowPlay FTS N/A'
+        return $alerts
+    }
+
+    if (Test-NvidiaStreamproofBypassActive -State $state) {
+        foreach ($entry in $state.Values.GetEnumerator()) {
+            $nameNorm = $entry.Key.Trim('{}').ToLower()
+            if ($nameNorm -ne $script:NvidiaStreamproofGuid.ToLower()) { continue }
+            if ($entry.Value -isnot [int]) { continue }
+            if ($script:NvidiaStreamproofValues -contains $entry.Value) {
+                $alerts += "FAILURE: NVIDIA streamproof bypass ($($entry.Key)=$($entry.Value))"
+            }
+        }
+        return $alerts
+    }
+
+    $alerts += 'SUCCESS: ShadowPlay FTS clean'
+    return $alerts
+}
 
 function Test-NvidiaGpuPresent {
     try {
@@ -856,36 +902,6 @@ function Get-NvidiaShadowPlayFtsFingerprint {
     }
     if ($parts.Count -eq 0) { return 'EMPTY' }
     return ($parts -join '|')
-}
-
-function Get-NvidiaShadowPlayFtsAlerts {
-    $alerts = @()
-    $state = Get-NvidiaShadowPlayFtsState
-    $nvidiaGpu = Test-NvidiaGpuPresent
-
-    if (-not $state.Exists) {
-        if ($nvidiaGpu) {
-            $alerts += 'WARNING: ShadowPlay FTS key missing (NVIDIA GPU detected)'
-        } else {
-            $alerts += 'SUCCESS: NVIDIA ShadowPlay N/A'
-        }
-        return $alerts
-    }
-
-    foreach ($entry in $state.Values.GetEnumerator()) {
-        $nameNorm = $entry.Key.Trim('{}').ToLower()
-        if ($nameNorm -ne $script:NvidiaStreamproofGuid.ToLower()) { continue }
-        if ($entry.Value -isnot [int]) { continue }
-        if ($script:NvidiaStreamproofValues -contains $entry.Value) {
-            $alerts += "FAILURE: NVIDIA streamproof bypass ($($entry.Key)=$($entry.Value))"
-        }
-    }
-
-    if ($alerts.Count -eq 0) {
-        $alerts += 'SUCCESS: ShadowPlay FTS clean'
-    }
-
-    return $alerts
 }
 
 function Get-MainCplProcessHits {
@@ -1653,8 +1669,7 @@ $reportedPrefetchHits = @{}
 $reportedCursorChanges = @{}
 $reportedMainCplHits = @{}
 $baselineCursorScheme = Get-CursorSchemeState
-$baselineNvidiaFts = Get-NvidiaShadowPlayFtsFingerprint
-$reportedNvidiaFtsChanges = @{}
+
 $reportedNvidiaStreamproof = @{}
 $reportedDefenderStatus = @{}
 $reportedRegistryTools = @{}
@@ -1799,24 +1814,6 @@ while ($true) {
         foreach ($line in (Get-NvidiaShadowPlayFtsAlerts)) {
             if ($line -like 'FAILURE*') {
                 if (-not $reportedNvidiaStreamproof.ContainsKey($line)) {
-                    $reportedNvidiaStreamproof[$line] = $true
-                    Write-MonitorAlert -Message $line -LogFile $logFile -Color Red
-                }
-            } elseif ($line -like 'WARNING*') {
-                $warnKey = "warn|$line"
-                if (-not $reportedNvidiaStreamproof.ContainsKey($warnKey)) {
-                    $reportedNvidiaStreamproof[$warnKey] = $true
-                    Write-MonitorAlert -Message $line -LogFile $logFile -Color Yellow
-                }
-            }
-        }
-
-        $currentNvidiaFts = Get-NvidiaShadowPlayFtsFingerprint
-        if ($currentNvidiaFts -ne $baselineNvidiaFts -and -not $reportedNvidiaFtsChanges.ContainsKey($currentNvidiaFts)) {
-            $reportedNvidiaFtsChanges[$currentNvidiaFts] = $true
-            Write-MonitorAlert -Message "NVIDIA ShadowPlay FTS changed: $currentNvidiaFts" -LogFile $logFile -Color Red
-            foreach ($line in (Get-NvidiaShadowPlayFtsAlerts)) {
-                if ($line -like 'FAILURE*') {
                     $reportedNvidiaStreamproof[$line] = $true
                     Write-MonitorAlert -Message $line -LogFile $logFile -Color Red
                 }
