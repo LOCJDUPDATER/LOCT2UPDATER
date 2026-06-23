@@ -33,7 +33,7 @@ function Test-Admin {
     return $p.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 }
 
-$script:LocTier2Version = '2.6.4'
+$script:LocTier2Version = '2.6.5'
 
 function Open-LocalMachineRegistryKey {
     param([string]$SubKeyPath)
@@ -179,11 +179,39 @@ function Invoke-ToolDownload {
         [Net.ServicePointManager]::SecurityProtocol = $previousProtocol
         if (-not $downloaded) { return $false }
 
-        Expand-Archive -Path $ZipPath -DestinationPath $DestDir -Force
+        if (Test-Path $DestDir) {
+            Remove-Item -LiteralPath $DestDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
+
+        if (-not (Expand-ToolArchive -ZipPath $ZipPath -DestDir $DestDir)) { return $false }
         return $true
     } catch {
         Write-Warning "Download failed: $($_.Exception.Message)"
         return $false
+    }
+}
+
+function Expand-ToolArchive {
+    param(
+        [string]$ZipPath,
+        [string]$DestDir
+    )
+
+    try {
+        Expand-Archive -Path $ZipPath -DestinationPath $DestDir -Force
+        return $true
+    } catch {
+        try {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+            if (-not (Test-Path $DestDir)) {
+                New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
+            }
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $DestDir)
+            return $true
+        } catch {
+            return $false
+        }
     }
 }
 
@@ -221,15 +249,24 @@ function Start-LocExternalTool {
         [string]$WindowStyle = 'Normal'
     )
 
-    $exe = Resolve-ToolExecutable -DestDir $DestDir -ExeName $ExeName -FallbackNames $FallbackExeNames
-    if (-not $exe) {
-        if (Invoke-ToolDownload -Url $Url -ZipPath $ZipPath -DestDir $DestDir) {
+    $exe = $null
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        if ($attempt -gt 1) {
+            Remove-Item -LiteralPath $DestDir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue
+        }
+
+        $exe = Resolve-ToolExecutable -DestDir $DestDir -ExeName $ExeName -FallbackNames $FallbackExeNames
+        if (-not $exe) {
+            if (-not (Invoke-ToolDownload -Url $Url -ZipPath $ZipPath -DestDir $DestDir)) { continue }
             $exe = Resolve-ToolExecutable -DestDir $DestDir -ExeName $ExeName -FallbackNames $FallbackExeNames
         }
+
+        if ($exe) { break }
     }
 
     if (-not $exe) {
-        Write-Host "WARNING: $Name unavailable (download or extract failed)." -ForegroundColor Yellow
+        Write-Host "FAILED: $Name unavailable (download blocked, AV, or extract failed)." -ForegroundColor Red
         return $false
     }
 
@@ -237,20 +274,37 @@ function Start-LocExternalTool {
 
     try {
         $startParams = @{
-            FilePath    = $exe
-            WindowStyle = $WindowStyle
-            PassThru    = $true
-            ErrorAction = 'Stop'
+            FilePath         = $exe
+            WorkingDirectory = Split-Path -Parent $exe
+            WindowStyle      = $WindowStyle
+            PassThru         = $true
+            ErrorAction      = 'Stop'
         }
         if ($StartArguments.Count -gt 0) { $startParams['ArgumentList'] = $StartArguments }
 
+        Write-Host "Launching $Name..." -ForegroundColor Green
         $proc = Start-Process @startParams
         if ($Wait) { $proc.WaitForExit() }
+        Write-Host "OK: $Name opened." -ForegroundColor Green
         return $true
     } catch {
-        Write-Host "WARNING: $Name failed to start: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "FAILED: $Name could not start - $($_.Exception.Message)" -ForegroundColor Red
         return $false
     }
+}
+
+function Complete-LocToolStep {
+    param(
+        [string]$Name,
+        [bool]$Succeeded
+    )
+
+    Write-Host ""
+    if (-not $Succeeded) {
+        Write-Host "Step skipped - $Name did not open. Check firewall/AV or run as admin." -ForegroundColor Yellow
+    }
+    Read-Host "Press Enter to continue" | Out-Null
+    Write-Host ""
 }
 
 function Show-WinObjCheckGuide {
@@ -1590,48 +1644,51 @@ try {
 Wait-NextStep "[4/8] Press Enter" "[4/8] Process Explorer"
 Show-LoadingBar
 
-Start-LocExternalTool -Name 'Process Explorer' `
+$toolOk = Start-LocExternalTool -Name 'Process Explorer' `
     -Url 'https://download.sysinternals.com/files/ProcessExplorer.zip' `
     -ZipPath "$env:TEMP\procexp.zip" `
     -DestDir "$env:TEMP\ProcessExplorer" `
     -ExeName 'procexp64.exe' `
     -FallbackExeNames @('procexp.exe') `
     -StartArguments @('/accepteula') `
-    -Wait | Out-Null
+    -Wait
+Complete-LocToolStep -Name 'Process Explorer' -Succeeded $toolOk
 
 Wait-NextStep "[5/8] Press Enter" "[5/8] Last Activity Viewer"
 Show-LoadingBar
 
-Start-LocExternalTool -Name 'Last Activity Viewer' `
+$toolOk = Start-LocExternalTool -Name 'Last Activity Viewer' `
     -Url 'https://www.nirsoft.net/utils/lastactivityview.zip' `
     -ZipPath "$env:TEMP\LastActivityView.zip" `
     -DestDir "$env:TEMP\LastActivity" `
     -ExeName 'LastActivityView.exe' `
-    -WindowStyle Maximized | Out-Null
+    -WindowStyle Maximized
+Complete-LocToolStep -Name 'Last Activity Viewer' -Succeeded $toolOk
 
 Wait-NextStep "[6/8] Press Enter" "[6/8] WinObj Check"
 Show-LoadingBar
 Show-WinObjCheckGuide
 
-Start-LocExternalTool -Name 'WinObj' `
+$toolOk = Start-LocExternalTool -Name 'WinObj' `
     -Url 'https://download.sysinternals.com/files/WinObj.zip' `
     -ZipPath "$env:TEMP\WinObj.zip" `
     -DestDir "$env:TEMP\WinObj" `
     -ExeName 'WinObj.exe' `
-    -StartArguments @('/accepteula') `
-    -Wait | Out-Null
+    -Wait
+Complete-LocToolStep -Name 'WinObj' -Succeeded $toolOk
 
 Wait-NextStep "[7/8] Press Enter" "[7/8] Autoruns"
 Show-LoadingBar
 Show-AutorunsCheckGuide
 
-Start-LocExternalTool -Name 'Autoruns' `
+$toolOk = Start-LocExternalTool -Name 'Autoruns' `
     -Url 'https://download.sysinternals.com/files/Autoruns.zip' `
     -ZipPath "$env:TEMP\Autoruns.zip" `
     -DestDir "$env:TEMP\Autoruns" `
     -ExeName 'Autoruns64.exe' `
     -FallbackExeNames @('Autoruns.exe') `
-    -Wait | Out-Null
+    -Wait
+Complete-LocToolStep -Name 'Autoruns' -Succeeded $toolOk
 
 Wait-NextStep "[8/8] Press Enter" "[8/8] Live Monitor"
 Show-LoadingBar
