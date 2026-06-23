@@ -33,7 +33,7 @@ function Test-Admin {
     return $p.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 }
 
-$script:LocTier2Version = '2.6.0'
+$script:LocTier2Version = '2.6.2'
 
 function Open-LocalMachineRegistryKey {
     param([string]$SubKeyPath)
@@ -253,112 +253,13 @@ function Start-LocExternalTool {
     }
 }
 
-function Get-UserAssistEntries {
-    $rows = @()
-    $uaRoot = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist'
-    if (-not (Test-Path $uaRoot)) { return $rows }
-
-    Get-ChildItem $uaRoot -ErrorAction SilentlyContinue | ForEach-Object {
-        $countKey = Join-Path $_.PSPath 'Count'
-        if (-not (Test-Path $countKey)) { return }
-        $props = Get-ItemProperty -Path $countKey -ErrorAction SilentlyContinue
-        foreach ($prop in $props.PSObject.Properties) {
-            if ($prop.Name -match '^(PSPath|PSParentPath|PSChildName|PSDrive|PSProvider)$') { continue }
-            $decoded = Convert-UserAssistName -Name $prop.Name
-            $runs = 0
-            if ($prop.Value -is [byte[]] -and $prop.Value.Length -ge 8) {
-                $runs = [BitConverter]::ToInt32($prop.Value, 4)
-            }
-            $rows += [PSCustomObject]@{
-                Source      = 'UserAssist'
-                Time        = ''
-                Application = $decoded
-                Path        = ''
-                Detail      = "Runs: $runs"
-            }
-        }
-    }
-
-    return @($rows)
-}
-
-function Get-ExecutionHistoryEntries {
-    $rows = [System.Collections.Generic.List[object]]::new()
-
-    foreach ($r in @(Get-ActivityModeratorEntries -SignatureBudget 0)) {
-        [void]$rows.Add([PSCustomObject]@{
-            Source      = 'BAM'
-            Time        = $r.'Last Execution Time'
-            Application = $r.Application
-            Path        = $r.Path
-            Detail      = $r.Signature
-        })
-    }
-
-    foreach ($u in @(Get-UserAssistEntries)) {
-        [void]$rows.Add($u)
-    }
-
-    return @($rows | Sort-Object {
-        if ([string]::IsNullOrWhiteSpace($_.Time)) { return [datetime]::MinValue }
-        try { [datetime]$_.Time } catch { [datetime]::MinValue }
-    } -Descending)
-}
-
-function Show-ExecutionHistoryExplorer {
-    param([array]$Entries)
-
-    Initialize-WinForms
-
-    $form = New-Object System.Windows.Forms.Form
-    $form.Text = "Executions History ($($Entries.Count))"
-    $form.WindowState = 'Maximized'
-    $form.StartPosition = 'CenterScreen'
-
-    $lv = New-Object System.Windows.Forms.ListView
-    $lv.View = 'Details'
-    $lv.FullRowSelect = $true
-    $lv.GridLines = $true
-    $lv.Dock = 'Fill'
-    $lv.Font = New-Object System.Drawing.Font('Segoe UI', 10)
-
-    foreach ($col in @('Source', 'Time', 'Application', 'Path', 'Detail')) {
-        $lv.Columns.Add($col, 180) | Out-Null
-    }
-
-    $lv.BeginUpdate()
-    try {
-        foreach ($entry in $Entries) {
-            $item = New-Object System.Windows.Forms.ListViewItem([string]$entry.Source)
-            $item.SubItems.Add([string]$entry.Time) | Out-Null
-            $item.SubItems.Add([string]$entry.Application) | Out-Null
-            $item.SubItems.Add([string]$entry.Path) | Out-Null
-            $item.SubItems.Add([string]$entry.Detail) | Out-Null
-
-            $kw = Get-MatchedCheatKeyword -Text (($entry.Application, $entry.Path, $entry.Detail) -join ' ')
-            if ($kw) { $item.BackColor = [System.Drawing.Color]::MistyRose }
-
-            $lv.Items.Add($item) | Out-Null
-        }
-    } finally {
-        $lv.EndUpdate()
-    }
-
-    $form.Controls.Add($lv)
-    [void]$form.ShowDialog()
-}
-
 function Show-WinObjCheckGuide {
-    Write-Host "--- WinObj Checklist ---" -ForegroundColor Cyan
-    Write-Host "Browse these areas in WinObj:" -ForegroundColor Yellow
-    foreach ($line in @(
-        'BaseNamedObjects - named mutexes/events from loaders',
-        'Sessions\<N>\BaseNamedObjects - per-session objects',
-        'GLOBAL?? - symbolic links and DosDevices mappings',
-        'Device - unusual driver device objects'
-    )) {
-        Write-Host "  * $line" -ForegroundColor Gray
-    }
+    Write-Host "Must navigate to Sessions > 0 > DosDevices and expand each subfolder." -ForegroundColor Yellow
+    Write-Host ""
+}
+
+function Show-AutorunsCheckGuide {
+    Write-Host "Check Logon, Services, Scheduled Tasks, and Image Hijacks for unsigned or suspicious entries." -ForegroundColor Yellow
     Write-Host ""
 }
 
@@ -1692,28 +1593,7 @@ Start-LocExternalTool -Name 'Last Activity Viewer' `
     -ExeName 'LastActivityView.exe' `
     -WindowStyle Maximized | Out-Null
 
-Wait-NextStep "[6/8] Press Enter" "[6/8] Executions History"
-Show-LoadingBar
-
-if (-not (Start-LocExternalTool -Name 'Executed Programs List' `
-        -Url 'https://www.nirsoft.net/utils/executedprogramslist.zip' `
-        -ZipPath "$env:TEMP\ExecutedProgramsList.zip" `
-        -DestDir "$env:TEMP\ExecutedProgramsList" `
-        -ExeName 'ExecutedProgramsList.exe' `
-        -WindowStyle Maximized)) {
-    try {
-        $historyEntries = @(Get-ExecutionHistoryEntries)
-        if ($historyEntries.Count -eq 0) {
-            Write-Host "WARNING: No execution history entries found" -ForegroundColor Yellow
-        } else {
-            Show-ExecutionHistoryExplorer -Entries $historyEntries
-        }
-    } catch {
-        Write-Warning "Executions history viewer failed: $($_.Exception.Message)"
-    }
-}
-
-Wait-NextStep "[7/8] Press Enter" "[7/8] WinObj Check"
+Wait-NextStep "[6/8] Press Enter" "[6/8] WinObj Check"
 Show-LoadingBar
 Show-WinObjCheckGuide
 
@@ -1722,6 +1602,19 @@ Start-LocExternalTool -Name 'WinObj' `
     -ZipPath "$env:TEMP\WinObj.zip" `
     -DestDir "$env:TEMP\WinObj" `
     -ExeName 'WinObj.exe' `
+    -StartArguments @('/accepteula') `
+    -Wait | Out-Null
+
+Wait-NextStep "[7/8] Press Enter" "[7/8] Autoruns"
+Show-LoadingBar
+Show-AutorunsCheckGuide
+
+Start-LocExternalTool -Name 'Autoruns' `
+    -Url 'https://download.sysinternals.com/files/Autoruns.zip' `
+    -ZipPath "$env:TEMP\Autoruns.zip" `
+    -DestDir "$env:TEMP\Autoruns" `
+    -ExeName 'Autoruns64.exe' `
+    -FallbackExeNames @('Autoruns.exe') `
     -StartArguments @('/accepteula') `
     -Wait | Out-Null
 
