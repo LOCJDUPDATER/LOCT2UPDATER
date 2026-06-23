@@ -33,7 +33,7 @@ function Test-Admin {
     return $p.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 }
 
-$script:LocTier2Version = '2.6.2'
+$script:LocTier2Version = '2.6.3'
 
 function Open-LocalMachineRegistryKey {
     param([string]$SubKeyPath)
@@ -1615,7 +1615,6 @@ Start-LocExternalTool -Name 'Autoruns' `
     -DestDir "$env:TEMP\Autoruns" `
     -ExeName 'Autoruns64.exe' `
     -FallbackExeNames @('Autoruns.exe') `
-    -StartArguments @('/accepteula') `
     -Wait | Out-Null
 
 Wait-NextStep "[8/8] Press Enter" "[8/8] Live Monitor"
